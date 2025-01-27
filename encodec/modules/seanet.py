@@ -17,6 +17,8 @@ from . import (
     SLSTM
 )
 
+np.random.seed(42)
+
 
 class SEANetResnetBlock(nn.Module):
     """Residual block from SEANet model.
