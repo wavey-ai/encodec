@@ -6,154 +6,52 @@
 
 """Arithmetic coder."""
 
-import typing as tp
 import io
+import math
 import random
+import typing as tp
 import torch
-import numpy as np
-
-print(torch.__config__.show())
 
 from ..binary import BitPacker, BitUnpacker
 
-# Define the fixed-point scaling factor
-FIXED_SCALE = 1 << 32
-
-def pdf_to_fixed_point(pdf: torch.Tensor) -> torch.Tensor:
-    """
-    Converts a floating-point PDF to fixed-point integer representation 
-    while eliminating floating-point precision drift.
-    """
-    assert torch.all(pdf >= 0), "PDF contains negative values!"
-    
-    # Ensure pdf is on CPU and double precision before conversion
-    pdf = pdf.to(torch.float64).cpu()
-    
-    # Perform scaling using integer arithmetic only
-    scaled_pdf = (pdf * FIXED_SCALE + 0.5).floor().to(torch.int64)
-
-    return scaled_pdf
-
-
-def deterministic_round(x: torch.Tensor) -> torch.Tensor:
-    """
-    Implements a deterministic rounding method: rounds half up.
-    """
-    return torch.floor(x + 0.5)
-
-def pdf_to_integer_counts_fixed(pdf_fixed: torch.Tensor, total_range: int) -> torch.Tensor:
-    """
-    Converts a fixed-point PDF into integer counts that sum to total_range using integer-only operations.
-    
-    Args:
-        pdf_fixed (torch.Tensor): Fixed-point integer representation of the PDF.
-        total_range (int): Desired sum of the integer counts.
-    
-    Returns:
-        torch.Tensor: Integer counts summing to total_range.
-    """
-    assert torch.all(pdf_fixed >= 0), "PDF contains negative values!"
-    assert torch.isclose(pdf_fixed.sum(), torch.tensor(FIXED_SCALE, dtype=pdf_fixed.dtype, device=pdf_fixed.device), atol=1), "PDF does not sum to fixed scale!"
- 
-    # Step 1: Scale the PDF using total_range and perform integer division
-    scaled_pdf = (pdf_fixed * total_range + (FIXED_SCALE // 2)) // FIXED_SCALE
-    
-    # Step 2: Calculate the sum of the scaled PDF
-    current_sum = scaled_pdf.sum().item()
-    deficit = total_range - current_sum
-    
-    # Step 3: Redistribute the deficit deterministically
-    if deficit > 0:
-        fractional_remainders = (pdf_fixed * total_range) % FIXED_SCALE
-        # Tie-breaking using indices to ensure deterministic sorting
-        sorted_indices = torch.argsort(
-            fractional_remainders * 1_000_000 + torch.arange(len(fractional_remainders), dtype=torch.int64, device=pdf_fixed.device),
-            descending=True
-        )
-        selected_indices = sorted_indices[:deficit]
-        scaled_pdf[selected_indices] += 1
-    
-    elif deficit < 0:
-        # Need to remove excess counts
-        excess = -deficit
-        sorted_indices = torch.argsort(scaled_pdf, descending=True)
-        scaled_pdf[sorted_indices[:excess]] -= 1
-    
-    return scaled_pdf
 
 def build_stable_quantized_cdf(pdf: torch.Tensor, total_range_bits: int,
-                               min_range: int = 2, check: bool = True) -> torch.Tensor:
-    """Integer-only version of build_stable_quantized_cdf that avoids floating point operations."""
+                               roundoff: float = 1e-8, min_range: int = 2,
+                               check: bool = True) -> torch.Tensor:
+    """Turn the given PDF into a quantized CDF that splits
+    [0, 2 ** self.total_range_bits - 1] into chunks of size roughly proportional
+    to the PDF.
 
-    total_range = 1 << total_range_bits
+    Args:
+        pdf (torch.Tensor): probability distribution, shape should be `[N]`.
+        total_range_bits (int): see `ArithmeticCoder`, the typical range we expect
+            during the coding process is `[0, 2 ** total_range_bits - 1]`.
+        roundoff (float): will round the pdf up to that level to remove difference coming
+        from e.g. evaluating the Language Model on different architectures.
+        min_range (int): minimum range width. Should always be at least 2 for numerical
+            stability. Use this to avoid pathological behavior is a value
+            that is expected to be rare actually happens in real life.
+        check (bool): if True, checks that nothing bad happened, can be deactivated for speed.
+    """
+    pdf = pdf.detach()
+    if roundoff:
+        pdf = (pdf / roundoff).floor() * roundoff
+    # interpolate with uniform distribution to achieve desired minimum probability.
+    total_range = 2 ** total_range_bits
     cardinality = len(pdf)
-
-    pdf_fixed = pdf_to_fixed_point(pdf)
-
-    counts = pdf_to_integer_counts_fixed(pdf_fixed, total_range)
-
-    deficit = min_range * cardinality - counts.sum().item()
-
-    if deficit > 0:
-        available = counts - min_range
-        available_total = available[available > 0].sum().item()
-
-        if available_total > 0:
-            reduction = (available * deficit).div(available_total, rounding_mode='floor')
-            counts[available > 0] -= reduction
-            deficit -= reduction.sum().item()
-
-        if deficit > 0:
-            per_symbol = deficit // cardinality
-            remainder = deficit % cardinality
-            counts += per_symbol
-            counts[:remainder] += 1
-
-    counts = torch.maximum(counts, torch.tensor(min_range))
-
-    # Scale down if we exceed total range
-    if counts.sum().item() > total_range:
-        scale = total_range / counts.sum().item()
-        counts = (counts * scale).round().long()
-        counts = torch.maximum(counts, torch.tensor(min_range))
-        counts[counts.argmax()] -= (counts.sum().item() - total_range)
-
-    # Build CDF through cumulative sum
-    quantized_cdf = torch.cumsum(counts, dim=-1)
-
+    alpha = min_range * cardinality / total_range
+    assert alpha <= 1, "you must reduce min_range"
+    ranges = (((1 - alpha) * total_range) * pdf).floor().long()
+    ranges += min_range
+    quantized_cdf = torch.cumsum(ranges, dim=-1)
+    if min_range < 2:
+        raise ValueError("min_range must be at least 2.")
     if check:
-        assert quantized_cdf[-1].item() <= 2 ** total_range_bits, f"CDF exceeds range: {quantized_cdf[-1]}"
-        ranges = torch.diff(quantized_cdf, prepend=torch.tensor([0]))
-        assert (ranges >= min_range).all(), f"Some ranges below minimum: {ranges.min().item()}"
-
-    #sys.exit(1)  # Exit immediately after logging first case
-
-
-    log_file = "quantized_cdf_log.txt"  # Log file path
-    with open(log_file, "a") as f:  # Corrected syntax
-        f.write(str(quantized_cdf) + "\n")
-
+        assert quantized_cdf[-1] <= 2 ** total_range_bits, quantized_cdf[-1]
+        if ((quantized_cdf[1:] - quantized_cdf[:-1]) < min_range).any() or quantized_cdf[0] < min_range:
+            raise ValueError("You must increase your total_range_bits.")
     return quantized_cdf
 
-
-def compute_effective_range(range_low: int, range_high: int, delta: int, total_range_bits: int) -> tp.Tuple[int, int]:
-    total_range = 1 << total_range_bits
-
-    # Scale delta using fixed-point scaling
-    scaled_delta = delta * FIXED_SCALE
-
-    # Compute effective_low and effective_high with fixed-point precision
-    effective_low_fixed = (range_low * scaled_delta + (total_range // 2)) // total_range
-    effective_high_fixed = (range_high * scaled_delta) // total_range
-
-    # Convert back from fixed-point to integer
-    effective_low = effective_low_fixed // FIXED_SCALE
-    effective_high = effective_high_fixed // FIXED_SCALE
-
-    # Ensure that effective_high is at least effective_low to maintain a valid range
-    effective_high = max(effective_high, effective_low)
-
-    return effective_low, effective_high
 
 class ArithmeticCoder:
     """ArithmeticCoder,
@@ -211,7 +109,7 @@ class ArithmeticCoder:
         return self.high - self.low + 1
 
     def _flush_common_prefix(self):
-        # If self.low and self.high start with the same bits,
+        # If self.low and self.high start with the sames bits,
         # those won't change anymore as we always just increase the range
         # by powers of 2, and we can flush them out to the bit stream.
         assert self.high >= self.low, (self.low, self.high)
@@ -235,17 +133,18 @@ class ArithmeticCoder:
 
         Args:
             symbol (int): symbol to encode with the AC.
-            quantized_cdf (torch.Tensor): use build_stable_quantized_cdf
+            quantized_cdf (torch.Tensor): use `build_stable_quantized_cdf`
                 to build this from your pdf estimate.
         """
-        while self.delta < (1 << self.total_range_bits):
-            self.low <<= 1
-            self.high = (self.high << 1) | 1
+        while self.delta < 2 ** self.total_range_bits:
+            self.low *= 2
+            self.high = self.high * 2 + 1
             self.max_bit += 1
 
         range_low = 0 if symbol == 0 else quantized_cdf[symbol - 1].item()
         range_high = quantized_cdf[symbol].item() - 1
-        effective_low, effective_high = compute_effective_range(range_low, range_high, self.delta, self.total_range_bits)
+        effective_low = int(math.ceil(range_low * (self.delta / (2 ** self.total_range_bits))))
+        effective_high = int(math.floor(range_high * (self.delta / (2 ** self.total_range_bits))))
         assert self.low <= self.high
         self.high = self.low + effective_high
         self.low = self.low + effective_low
@@ -269,17 +168,17 @@ class ArithmeticCoder:
 
 
 class ArithmeticDecoder:
-    """ArithmeticDecoder, see ArithmeticCoder for a detailed explanation.
+    """ArithmeticDecoder, see `ArithmeticCoder` for a detailed explanation.
 
     Note that this must be called with **exactly** the same parameters and sequence
     of quantized cdf as the arithmetic encoder or the wrong values will be decoded.
 
-    If the AC encoder current range is [L, H], with L and H having the some common
+    If the AC encoder current range is [L, H], with `L` and `H` having the some common
     prefix (i.e. the same most significant bits), then this prefix will be flushed to the stream.
-    For instances, having read 3 bits b1 b2 b3, we know that [L, H] is contained inside
-    [b1 b2 b3 0 ... 0 b1 b3 b3 1 ... 1]. Now this specific sub-range can only be obtained
+    For instances, having read 3 bits `b1 b2 b3`, we know that `[L, H]` is contained inside
+    `[b1 b2 b3 0 ... 0 b1 b3 b3 1 ... 1]`. Now this specific sub-range can only be obtained
     for a specific sequence of symbols and a binary-search allows us to decode those symbols.
-    At some point, the prefix b1 b2 b3 will no longer be sufficient to decode new symbols,
+    At some point, the prefix `b1 b2 b3` will no longer be sufficient to decode new symbols,
     and we will need to read new bits from the stream and repeat the process.
 
     """
@@ -317,70 +216,20 @@ class ArithmeticDecoder:
 
     def pull(self, quantized_cdf: torch.Tensor) -> tp.Optional[int]:
         """Pull a symbol, reading as many bits from the stream as required.
-        This returns None when the stream has been exhausted.
+        This returns `None` when the stream has been exhausted.
 
         Args:
-            quantized_cdf (torch.Tensor): use build_stable_quantized_cdf
-                to build this from your pdf estimate. This must be **exactly**
+            quantized_cdf (torch.Tensor): use `build_stable_quantized_cdf`
+                to build this from your pdf estimate. This must be **exatly**
                 the same cdf as the one used at encoding time.
         """
-        while self.delta < (1 << self.total_range_bits):
+        while self.delta < 2 ** self.total_range_bits:
             bit = self.unpacker.pull()
             if bit is None:
                 return None
-            self.low <<= 1
-            self.high = (self.high << 1) | 1
-            self.current = (self.current << 1) | bit
-            self.max_bit += 1
-
-        log_file = "binary_search_log.txt"  # Log file path
-        with open(log_file, "a") as f:
-
-            def bin_search(low_idx: int, high_idx: int):
-                if high_idx < low_idx:
-                    raise RuntimeError("Binary search failed")
-                mid = (low_idx + high_idx) // 2
-                range_low = quantized_cdf[mid - 1].item() if mid > 0 else 0
-                range_high = quantized_cdf[mid].item() - 1
-                effective_low, effective_high = compute_effective_range(range_low, range_high, self.delta, self.total_range_bits)
-                low = effective_low + self.low
-                high = effective_high + self.low
-
-                # Log each iteration
-                f.write(f"low_idx={low_idx}, high_idx={high_idx}, mid={mid}, low={low}, high={high}, current={self.current}\n")
-
-                if self.current >= low:
-                    if self.current <= high:
-                        return (mid, low, high, self.current)
-                    else:
-                        return bin_search(mid + 1, high_idx)
-                else:
-                    return bin_search(low_idx, mid - 1)
-
-            self._last = (self.low, self.high, self.current, self.max_bit)
-            sym, self.low, self.high, self.current = bin_search(0, len(quantized_cdf) - 1)
-            self._dbg.append((self.low, self.high, self.current))
-            self._flush_common_prefix()
-            self._dbg2.append((self.low, self.high, self.current))
-
-            return sym
-
-    def pullx(self, quantized_cdf: torch.Tensor) -> tp.Optional[int]:
-        """Pull a symbol, reading as many bits from the stream as required.
-        This returns None when the stream has been exhausted.
-
-        Args:
-            quantized_cdf (torch.Tensor): use build_stable_quantized_cdf
-                to build this from your pdf estimate. This must be **exactly**
-                the same cdf as the one used at encoding time.
-        """
-        while self.delta < (1 << self.total_range_bits):
-            bit = self.unpacker.pull()
-            if bit is None:
-                return None
-            self.low <<= 1
-            self.high = (self.high << 1) | 1
-            self.current = (self.current << 1) | bit
+            self.low *= 2
+            self.high = self.high * 2 + 1
+            self.current = self.current * 2 + bit
             self.max_bit += 1
 
         def bin_search(low_idx: int, high_idx: int):
@@ -390,7 +239,8 @@ class ArithmeticDecoder:
             mid = (low_idx + high_idx) // 2
             range_low = quantized_cdf[mid - 1].item() if mid > 0 else 0
             range_high = quantized_cdf[mid].item() - 1
-            effective_low, effective_high = compute_effective_range(range_low, range_high, self.delta, self.total_range_bits)
+            effective_low = int(math.ceil(range_low * (self.delta / (2 ** self.total_range_bits))))
+            effective_high = int(math.floor(range_high * (self.delta / (2 ** self.total_range_bits))))
             low = effective_low + self.low
             high = effective_high + self.low
             if self.current >= low:
@@ -440,4 +290,3 @@ def test():
 
 if __name__ == "__main__":
     test()
-

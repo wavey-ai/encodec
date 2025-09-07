@@ -13,68 +13,57 @@ import typing as tp
 import numpy as np
 import torch
 from torch import nn
-import torch.nn.init as init
 
 from . import quantization as qt
 from . import modules as m
 from .utils import _check_checksum, _linear_overlap_add, _get_checkpoint_url
 
-import random
 
 ROOT_URL = 'https://dl.fbaipublicfiles.com/encodec/v0/'
 
 EncodedFrame = tp.Tuple[torch.Tensor, tp.Optional[torch.Tensor]]
 
 
-def stable_softmax(x: torch.Tensor) -> torch.Tensor:
-    x_max = x.max(dim=1, keepdim=True)[0]
-    exp_x = torch.exp(x - x_max) 
-    return exp_x / exp_x.sum(dim=1, keepdim=True)
-
 class LMModel(nn.Module):
-    def __init__(self, n_q: int = 32, card: int = 512, dim: int = 128, max_context: int = 1024, **kwargs):
+    """Language Model to estimate probabilities of each codebook entry.
+    We predict all codebooks in parallel for a given time step.
+
+    Args:
+        n_q (int): number of codebooks.
+        card (int): codebook cardinality.
+        dim (int): transformer dimension.
+        **kwargs: passed to `encodec.modules.transformer.StreamingTransformerEncoder`.
+    """
+    def __init__(self, n_q: int = 32, card: int = 1024, dim: int = 200, **kwargs):
         super().__init__()
         self.card = card
         self.n_q = n_q
         self.dim = dim
-        self.max_context = max_context
-
         self.transformer = m.StreamingTransformerEncoder(dim=dim, **kwargs)
         self.emb = nn.ModuleList([nn.Embedding(card + 1, dim) for _ in range(n_q)])
         self.linears = nn.ModuleList([nn.Linear(dim, card) for _ in range(n_q)])
 
-        for emb in self.emb:
-            init.normal_(emb.weight, mean=0.0, std=0.02)
-        for linear in self.linears:
-            init.normal_(linear.weight, mean=0.0, std=0.02)
-            init.zeros_(linear.bias)
-
-    def quantize_logits(self, probs: torch.Tensor, precision: int = 7) -> torch.Tensor:
-        scale = 10**precision
-        return (probs * scale).round().div(scale)
-
     def forward(self, indices: torch.Tensor,
-                states: tp.Optional[tp.List[torch.Tensor]] = None,
-                offset: int = 0):
-        if offset >= self.max_context:
-            states = None
-            offset = 0
+                states: tp.Optional[tp.List[torch.Tensor]] = None, offset: int = 0):
+        """
+        Args:
+            indices (torch.Tensor): indices from the previous time step. Indices
+                should be 1 + actual index in the codebook. The value 0 is reserved for
+                when the index is missing (i.e. first time step). Shape should be
+                `[B, n_q, T]`.
+            states: state for the streaming decoding.
+            offset: offset of the current time step.
 
-        K = indices.shape[1]
-        input_ = torch.zeros_like(self.emb[0](indices[:, 0]))
-        for k in range(K):
-            input_ += self.emb[k](indices[:, k])
+        Returns a 3-tuple `(probabilities, new_states, new_offset)` with probabilities
+        with a shape `[B, card, n_q, T]`.
 
+        """
+        B, K, T = indices.shape
+        input_ = sum([self.emb[k](indices[:, k]) for k in range(K)])
         out, states, offset = self.transformer(input_, states, offset)
+        logits = torch.stack([self.linears[k](out) for k in range(K)], dim=1).permute(0, 3, 1, 2)
+        return torch.softmax(logits, dim=1), states, offset
 
-        logits = torch.stack([
-            self.linears[k](out) for k in range(K)
-        ], dim=1).permute(0, 3, 1, 2)
-
-        probs = stable_softmax(logits)
-        probs = self.quantize_logits(probs)
-
-        return probs, states, offset
 
 class EncodecModel(nn.Module):
     """EnCodec model operating on the raw waveform.
@@ -170,7 +159,7 @@ class EncodecModel(nn.Module):
             scale = None
 
         emb = self.encoder(x)
-        codes = self.quantizer.encode(emb.to('cpu'), self.frame_rate, self.bandwidth).to(emb.device)
+        codes = self.quantizer.encode(emb, self.frame_rate, self.bandwidth)
         codes = codes.transpose(0, 1)
         # codes is [B, K, T], with T frames, K nb of codebooks.
         return codes, scale
@@ -212,7 +201,7 @@ class EncodecModel(nn.Module):
         """
         device = next(self.parameters()).device
         lm = LMModel(self.quantizer.n_q, self.quantizer.bins, num_layers=5, dim=200,
-                     past_context=int(1 * self.frame_rate)).to(device)
+                     past_context=int(3.5 * self.frame_rate)).to(device)
         checkpoints = {
             'encodec_24khz': 'encodec_lm_24khz-1608e3c0.th',
             'encodec_48khz': 'encodec_lm_48khz-7add9fc3.th',
