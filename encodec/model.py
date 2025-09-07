@@ -34,36 +34,27 @@ class LMModel(nn.Module):
         dim (int): transformer dimension.
         **kwargs: passed to `encodec.modules.transformer.StreamingTransformerEncoder`.
     """
+class LMModel(nn.Module):
     def __init__(self, n_q: int = 32, card: int = 1024, dim: int = 200, **kwargs):
         super().__init__()
         self.card = card
         self.n_q = n_q
         self.dim = dim
-        self.transformer = m.StreamingTransformerEncoder(dim=dim, **kwargs)
-        self.emb = nn.ModuleList([nn.Embedding(card + 1, dim) for _ in range(n_q)])
-        self.linears = nn.ModuleList([nn.Linear(dim, card) for _ in range(n_q)])
+        self.transformer = m.StreamingTransformerEncoder(dim=dim, **kwargs).to(torch.float64)
+        self.emb = nn.ModuleList([nn.Embedding(card + 1, dim, dtype=torch.float64) for _ in range(n_q)])
+        self.linears = nn.ModuleList([nn.Linear(dim, card, dtype=torch.float64) for _ in range(n_q)])
+        self.logit_step = 1.0 / 8.0
+        self.tau = 2.0
 
     def forward(self, indices: torch.Tensor,
                 states: tp.Optional[tp.List[torch.Tensor]] = None, offset: int = 0):
-        """
-        Args:
-            indices (torch.Tensor): indices from the previous time step. Indices
-                should be 1 + actual index in the codebook. The value 0 is reserved for
-                when the index is missing (i.e. first time step). Shape should be
-                `[B, n_q, T]`.
-            states: state for the streaming decoding.
-            offset: offset of the current time step.
-
-        Returns a 3-tuple `(probabilities, new_states, new_offset)` with probabilities
-        with a shape `[B, card, n_q, T]`.
-
-        """
         B, K, T = indices.shape
         input_ = sum([self.emb[k](indices[:, k]) for k in range(K)])
         out, states, offset = self.transformer(input_, states, offset)
         logits = torch.stack([self.linears[k](out) for k in range(K)], dim=1).permute(0, 3, 1, 2)
-        return torch.softmax(logits, dim=1), states, offset
-
+        logits = torch.round(logits / self.logit_step) * self.logit_step  # quantize on f64
+        probas = torch.softmax(logits / self.tau, dim=1)
+        return probas, states, offset
 
 class EncodecModel(nn.Module):
     """EnCodec model operating on the raw waveform.
