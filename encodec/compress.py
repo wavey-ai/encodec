@@ -102,29 +102,21 @@ def _deterministic_cdf(pdf: torch.Tensor,
 
 def compress_to_file(model: EncodecModel, wav: torch.Tensor, fo: tp.IO[bytes],
                      use_lm: bool = True):
-    """
-    Compress a waveform to a file-object using the given model.
-    Deterministic path is enforced unconditionally (no metadata flags).
-    """
-    assert wav.dim() == 2, "Expected [C, T]."
+    assert wav.dim() == 2
     if model.name not in MODELS:
         raise ValueError(f"Unsupported model {model.name}.")
 
-    device = wav.device
+    coder_device = torch.device("cpu")
 
-    # Encode once to know frames and K
     with torch.no_grad():
         frames = model.encode(wav[None])
     codes0, _ = frames[0]
     _, K, _ = codes0.shape
 
-    # Language model (float64), but logits quantized before softmax
     lm = None
     if use_lm:
-        lm = model.get_lm_model().to(dtype=torch.float64, device=device)
-        lm.eval()
+        lm = model.get_lm_model().to(dtype=torch.float64, device=coder_device).eval()
 
-    # Minimal, unchanged metadata set (no new flags)
     metadata = {
         'm': model.name,
         'al': int(wav.shape[-1]),
@@ -135,7 +127,6 @@ def compress_to_file(model: EncodecModel, wav: torch.Tensor, fo: tp.IO[bytes],
     }
     binary.write_ecdc_header(fo, metadata)
 
-    # Bitstream
     for (frame, scale) in frames:
         if scale is not None:
             fo.write(struct.pack('!f', float(scale.cpu().item())))
@@ -143,43 +134,36 @@ def compress_to_file(model: EncodecModel, wav: torch.Tensor, fo: tp.IO[bytes],
         _B, _K, T = frame.shape
         if use_lm:
             coder = ArithmeticCoder(fo)
-            states: tp.Any = None
+            states = None
             offset = 0
-            input_ = torch.zeros(1, K, 1, dtype=torch.long, device=device)
+            input_ = torch.zeros(1, K, 1, dtype=torch.long, device=coder_device)
         else:
             packer = binary.BitPacker(model.bits_per_codebook, fo)
 
         for t in range(T):
             if use_lm:
                 with torch.no_grad():
-                    probas_raw, states, offset = lm(input_, states, offset)   # [1, card, K, 1]
-                    # Quantize logits (rebuild from probs with log if needed)
-                    # Safer: pass-through by reverse softmax → logits, quantize, softmax
-                    # But we only get probas. So enforce quantization by re-logit with clip.
-                    # To avoid log(0), clamp and then re-softmax.
-                    p = torch.clamp(probas_raw, min=1e-12)
-                    logits = torch.log(p)
-                    logits_q = _quantize_logits_(logits, LOGIT_QSTEP)
-                    probas = _stable_softmax(logits_q, dim=1)
-            for k, value in enumerate(frame[0, :, t].tolist()):
-                if use_lm:
+                    logits_raw, states, offset = lm.forward_logits(input_, states, offset)
+                    logits_q = _quantize_logits_(logits_raw, LOGIT_QSTEP)
+                    probas = _stable_softmax(logits_q / lm.tau, dim=1)
+
+                frame_slice = frame[:, :, t: t + 1].detach().to(coder_device)
+                values = frame_slice[0, :, 0].tolist()
+                for k, value in enumerate(values):
                     q_cdf = _deterministic_cdf(probas[0, :, k, 0], coder.total_range_bits, fp_scale=FP_SCALE, check=False)
                     coder.push(value, q_cdf)
-                else:
+                input_ = 1 + frame_slice
+            else:
+                values = frame[0, :, t].detach().cpu().tolist()
+                for value in values:
                     packer.push(value)
-            if use_lm:
-                input_ = 1 + frame[:, :, t: t + 1]
 
         if use_lm:
             coder.flush()
         else:
             packer.flush()
 
-
 def decompress_from_file(fo: tp.IO[bytes], device='cpu') -> tp.Tuple[torch.Tensor, int]:
-    """
-    Decompress from a file-object. Deterministic path (matching encoder) is used unconditionally.
-    """
     metadata = binary.read_ecdc_header(fo)
     model_name = metadata['m']
     audio_length = int(metadata['al'])
@@ -194,11 +178,12 @@ def decompress_from_file(fo: tp.IO[bytes], device='cpu') -> tp.Tuple[torch.Tenso
         raise ValueError("Unsupported bitstream version; re-encode with this coder.")
 
     model = MODELS[model_name]().to(device)
+    model_device = next(model.parameters()).device
+    coder_device = torch.device("cpu")
 
     lm = None
     if use_lm:
-        lm = model.get_lm_model().to(dtype=torch.float64, device=device)
-        lm.eval()
+        lm = model.get_lm_model().to(dtype=torch.float64, device=coder_device).eval()
 
     frames: tp.List[EncodedFrame] = []
     segment_length = model.segment_length or audio_length
@@ -210,50 +195,50 @@ def decompress_from_file(fo: tp.IO[bytes], device='cpu') -> tp.Tuple[torch.Tenso
 
         if model.normalize:
             scale_f, = struct.unpack('!f', binary._read_exactly(fo, struct.calcsize('!f')))
-            scale = torch.tensor(scale_f, device=device).view(1)
+            scale = torch.tensor(scale_f, device=coder_device).view(1)
         else:
             scale = None
 
         if use_lm:
             decoder = ArithmeticDecoder(fo)
-            states: tp.Any = None
+            states = None
             offset = 0
-            input_ = torch.zeros(1, num_codebooks, 1, dtype=torch.long, device=device)
+            input_ = torch.zeros(1, num_codebooks, 1, dtype=torch.long, device=coder_device)
         else:
             unpacker = binary.BitUnpacker(model.bits_per_codebook, fo)
 
-        frame = torch.zeros(1, num_codebooks, frame_length, dtype=torch.long, device=device)
+        frame = torch.zeros(1, num_codebooks, frame_length, dtype=torch.long, device=coder_device)
 
         for t in range(frame_length):
             if use_lm:
                 with torch.no_grad():
-                    probas_raw, states, offset = lm(input_, states, offset)
-                    p = torch.clamp(probas_raw, min=1e-12)
-                    logits = torch.log(p)
-                    logits_q = _quantize_logits_(logits, LOGIT_QSTEP)
-                    probas = _stable_softmax(logits_q, dim=1)
+                    logits_raw, states, offset = lm.forward_logits(input_, states, offset)
+                    logits_q = _quantize_logits_(logits_raw, LOGIT_QSTEP)
+                    probas = _stable_softmax(logits_q / lm.tau, dim=1)
 
-            code_list: tp.List[int] = []
-            for k in range(num_codebooks):
-                if use_lm:
+                code_list: tp.List[int] = []
+                for k in range(num_codebooks):
                     q_cdf = _deterministic_cdf(probas[0, :, k, 0], decoder.total_range_bits, fp_scale=fp_scale, check=False)
                     code = decoder.pull(q_cdf)
-                else:
-                    code = unpacker.pull()
-                if code is None:
-                    raise EOFError("The stream ended sooner than expected.")
-                code_list.append(code)
-
-            frame[0, :, t] = torch.tensor(code_list, dtype=torch.long, device=device)
-            if use_lm:
+                    if code is None:
+                        raise EOFError("The stream ended sooner than expected.")
+                    code_list.append(code)
+                frame[0, :, t] = torch.tensor(code_list, dtype=torch.long, device=coder_device)
                 input_ = 1 + frame[:, :, t: t + 1]
+            else:
+                code_list: tp.List[int] = []
+                for _ in range(num_codebooks):
+                    code = unpacker.pull()
+                    if code is None:
+                        raise EOFError("The stream ended sooner than expected.")
+                    code_list.append(code)
+                frame[0, :, t] = torch.tensor(code_list, dtype=torch.long, device=coder_device)
 
-        frames.append((frame, scale))
+        frames.append((frame.to(model_device), None if scale is None else scale.to(model_device)))
 
     with torch.no_grad():
         wav = model.decode(frames)
     return wav[0, :, :audio_length], model.sample_rate
-
 
 def compress(model: EncodecModel, wav: torch.Tensor, use_lm: bool = False) -> bytes:
     fo = io.BytesIO()

@@ -35,24 +35,30 @@ class LMModel(nn.Module):
         **kwargs: passed to `encodec.modules.transformer.StreamingTransformerEncoder`.
     """
 class LMModel(nn.Module):
-    def __init__(self, n_q: int = 32, card: int = 1024, dim: int = 200, **kwargs):
+    def __init__(self, n_q: int = 32, card: int = 1024, dim: int = 200, dtype=torch.float64, **kwargs):
         super().__init__()
         self.card = card
         self.n_q = n_q
         self.dim = dim
-        self.transformer = m.StreamingTransformerEncoder(dim=dim, **kwargs).to(torch.float64)
-        self.emb = nn.ModuleList([nn.Embedding(card + 1, dim, dtype=torch.float64) for _ in range(n_q)])
-        self.linears = nn.ModuleList([nn.Linear(dim, card, dtype=torch.float64) for _ in range(n_q)])
-        self.logit_step = 1.0 / 8.0
+        self.dtype = dtype
+        self.transformer = m.StreamingTransformerEncoder(dim=dim, **kwargs).to(dtype)
+        self.emb = nn.ModuleList([nn.Embedding(card + 1, dim, dtype=dtype) for _ in range(n_q)])
+        self.linears = nn.ModuleList([nn.Linear(dim, card, dtype=dtype) for _ in range(n_q)])
+        self.logit_step = 1.0 / 64.0
         self.tau = 2.0
 
-    def forward(self, indices: torch.Tensor,
-                states: tp.Optional[tp.List[torch.Tensor]] = None, offset: int = 0):
+    def forward_logits(self, indices: torch.Tensor,
+                       states: tp.Optional[tp.List[torch.Tensor]] = None, offset: int = 0):
         B, K, T = indices.shape
         input_ = sum([self.emb[k](indices[:, k]) for k in range(K)])
         out, states, offset = self.transformer(input_, states, offset)
         logits = torch.stack([self.linears[k](out) for k in range(K)], dim=1).permute(0, 3, 1, 2)
-        logits = torch.round(logits / self.logit_step) * self.logit_step  # quantize on f64
+        return logits, states, offset
+
+    def forward(self, indices: torch.Tensor,
+                states: tp.Optional[tp.List[torch.Tensor]] = None, offset: int = 0):
+        logits, states, offset = self.forward_logits(indices, states, offset)
+        logits = torch.round(logits / self.logit_step) * self.logit_step
         probas = torch.softmax(logits / self.tau, dim=1)
         return probas, states, offset
 
@@ -187,23 +193,15 @@ class EncodecModel(nn.Module):
                              f"Select one of {self.target_bandwidths}.")
         self.bandwidth = bandwidth
 
-    def get_lm_model(self) -> LMModel:
-        """Return the associated LM model to improve the compression rate.
-        """
-        device = next(self.parameters()).device
+    def get_lm_model(self, int8: bool = False) -> LMModel:
+        device = torch.device("cpu")
         lm = LMModel(self.quantizer.n_q, self.quantizer.bins, num_layers=5, dim=200,
-                     past_context=int(3.5 * self.frame_rate)).to(device)
-        checkpoints = {
-            'encodec_24khz': 'encodec_lm_24khz-1608e3c0.th',
-            'encodec_48khz': 'encodec_lm_48khz-7add9fc3.th',
-        }
-        try:
-            checkpoint_name = checkpoints[self.name]
-        except KeyError:
-            raise RuntimeError("No LM pre-trained for the current Encodec model.")
+                    past_context=int(3.5 * self.frame_rate), dtype=torch.float64).to(device)
+        checkpoints = {'encodec_24khz': 'encodec_lm_24khz-1608e3c0.th',
+                    'encodec_48khz': 'encodec_lm_48khz-7add9fc3.th'}
+        checkpoint_name = checkpoints[self.name]
         url = _get_checkpoint_url(ROOT_URL, checkpoint_name)
-        state = torch.hub.load_state_dict_from_url(
-            url, map_location='cpu', check_hash=True)  # type: ignore
+        state = torch.hub.load_state_dict_from_url(url, map_location='cpu', check_hash=True)
         lm.load_state_dict(state)
         lm.eval()
         return lm
