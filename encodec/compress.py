@@ -29,29 +29,51 @@ MODELS = {
 # - LOGIT_QSTEP: coarse enough to suppress tiny arch drift, fine enough to preserve coding gain
 # - FP_SCALE:    count scale used before integer range allocation inside the CDF
 LOGIT_QSTEP = 1.0 / 64.0
-FP_SCALE = 1 << 14       # 16384; lower than 1<<16 for better cross-arch stability
-ROUND_CDF = 1e-4         # unused in this deterministic path, kept for signature parity
-MIN_RANGE = 2            # min bin width for arithmetic coder
+FP_SCALE = 1 << 11
+MIN_RANGE = 6            # min bin width for arithmetic coder
 
+def _counts_from_pdf(pdf: torch.Tensor, fp_scale: int) -> torch.Tensor:
+    x = (pdf.detach().to(torch.float64).clamp_min(0) * fp_scale)
+    fx = torch.floor(x)
+    frac = x - fx
+    eps_edge = math.ldexp(1.0, -40)
+    m = (frac <= eps_edge) | (frac >= 1 - eps_edge)
+    if bool(m.any()):
+        idx = torch.arange(x.numel(), device=x.device, dtype=torch.int64).view_as(x)
+        sign = (idx.fmod(2) * 2 - 1).to(torch.float64)
+        eps = math.ldexp(1.0, -60)
+        x = torch.where(m, x + sign * eps, x)
+        fx = torch.floor(x)
+    return fx.to(torch.int64)
 
 def _quantize_logits_(logits: torch.Tensor, step: float = LOGIT_QSTEP) -> torch.Tensor:
-    # In-place-ish quantization without breaking autograd (we're in no_grad anyway).
-    return torch.round(logits / step) * step
+    y = (logits / step).to(torch.float64)
+    eps = math.ldexp(1.0, -40)
+    q = torch.floor(y + 0.5 - eps)
+    return q * step
 
+def _softmax_or_uniform(x: torch.Tensor, dim: int) -> torch.Tensor:
+    s = _stable_softmax(x, dim)
+    span_logit = torch.amax(x, dim=dim, keepdim=True) - torch.amin(x, dim=dim, keepdim=True)
+    near_logit = span_logit <= (2 * LOGIT_QSTEP)
+    span_pdf = torch.amax(s, dim=dim, keepdim=True) - torch.amin(s, dim=dim, keepdim=True)
+    near_pdf = span_pdf <= (0.25 / float(FP_SCALE))
+    near = near_logit | near_pdf
+    if not bool(near.any()):
+        return s
+    k = x.size(dim)
+    u = torch.full_like(s, 1.0 / k, dtype=torch.float64)
+    return torch.where(near, u, s)
 
 def _stable_softmax(logits: torch.Tensor, dim: int) -> torch.Tensor:
-    # f64 softmax with explicit max subtraction for numerical stability
-    m = torch.amax(logits, dim=dim, keepdim=True)
-    z = torch.exp((logits - m).to(torch.float64))
-    s = torch.sum(z, dim=dim, keepdim=True)
-    # safeguard in case of weird NaNs/Inf
-    bad = ~torch.isfinite(s) | (s <= 0)
-    if bad.any():
-        # replace by uniform
-        z = torch.ones_like(z, dtype=torch.float64)
-        s = torch.sum(z, dim=dim, keepdim=True)
-    return z / s
-
+    x = (logits - torch.amax(logits, dim=dim, keepdim=True)).to(torch.float64)
+    z = torch.exp(x)
+    z = z.movedim(dim, -1).contiguous()
+    acc = z[..., 0].clone()
+    for i in range(1, z.size(-1)):
+        acc += z[..., i]
+    out = (z / acc.unsqueeze(-1)).movedim(-1, dim)
+    return out
 
 def _deterministic_cdf(pdf: torch.Tensor,
                        total_range_bits: int,
@@ -71,7 +93,7 @@ def _deterministic_cdf(pdf: torch.Tensor,
         pdf = torch.ones_like(pdf)
         s = pdf.sum()
 
-    num = torch.floor(pdf * fp_scale).to(torch.int64)
+    num = _counts_from_pdf(pdf, fp_scale).to(torch.int64)
     if int(num.sum().item()) <= 0:
         num = torch.ones_like(num)
 
@@ -144,8 +166,8 @@ def compress_to_file(model: EncodecModel, wav: torch.Tensor, fo: tp.IO[bytes],
             if use_lm:
                 with torch.no_grad():
                     logits_raw, states, offset = lm.forward_logits(input_, states, offset)
-                    logits_q = _quantize_logits_(logits_raw, LOGIT_QSTEP)
-                    probas = _stable_softmax(logits_q / lm.tau, dim=1)
+                    logits_q = _quantize_logits_(logits_raw / lm.tau, LOGIT_QSTEP)
+                    probas = _softmax_or_uniform(logits_q, dim=1)
 
                 frame_slice = frame[:, :, t: t + 1].detach().to(coder_device)
                 values = frame_slice[0, :, 0].tolist()
@@ -213,8 +235,8 @@ def decompress_from_file(fo: tp.IO[bytes], device='cpu') -> tp.Tuple[torch.Tenso
             if use_lm:
                 with torch.no_grad():
                     logits_raw, states, offset = lm.forward_logits(input_, states, offset)
-                    logits_q = _quantize_logits_(logits_raw, LOGIT_QSTEP)
-                    probas = _stable_softmax(logits_q / lm.tau, dim=1)
+                    logits_q = _quantize_logits_(logits_raw / lm.tau, LOGIT_QSTEP)
+                    probas = _softmax_or_uniform(logits_q, dim=1)
 
                 code_list: tp.List[int] = []
                 for k in range(num_codebooks):
@@ -249,4 +271,3 @@ def compress(model: EncodecModel, wav: torch.Tensor, use_lm: bool = False) -> by
 def decompress(compressed: bytes, device='cpu') -> tp.Tuple[torch.Tensor, int]:
     fo = io.BytesIO(compressed)
     return decompress_from_file(fo, device=device)
-
