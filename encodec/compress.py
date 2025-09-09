@@ -20,22 +20,20 @@ from .quantization.ac import (
     ArithmeticDecoder,
 )
 
-# Hard determinism toggles
 torch.use_deterministic_algorithms(True)
 torch.backends.mkldnn.enabled = False
 
-# Registry
 MODELS = {
     'encodec_24khz': EncodecModel.encodec_model_24khz,
     'encodec_48khz': EncodecModel.encodec_model_48khz,
 }
 
-# Chosen scales for stability vs. compression efficiency
-# - LOGIT_QSTEP: coarse enough to suppress tiny arch drift, fine enough to preserve coding gain
-# - FP_SCALE:    count scale used before integer range allocation inside the CDF
 LOGIT_QSTEP = 1.0 / 64.0
 FP_SCALE = 1 << 11
-MIN_RANGE = 6            # min bin width for arithmetic coder
+MIN_RANGE = 6
+
+_IDX_CACHE: tp.Dict[tp.Tuple[str, int, int], torch.Tensor] = {}
+_UNIFORM_CDF_CACHE: tp.Dict[tp.Tuple[str, int, int, int, int], torch.Tensor] = {}
 
 def _counts_from_pdf(pdf: torch.Tensor, fp_scale: int) -> torch.Tensor:
     x = (pdf.detach().to(torch.float64).clamp_min(0) * fp_scale)
@@ -74,9 +72,7 @@ def _stable_softmax(logits: torch.Tensor, dim: int) -> torch.Tensor:
     x = (logits - torch.amax(logits, dim=dim, keepdim=True)).to(torch.float64)
     z = torch.exp(x)
     z = z.movedim(dim, -1).contiguous()
-    acc = z[..., 0].clone()
-    for i in range(1, z.size(-1)):
-        acc += z[..., i]
+    acc = torch.cumsum(z, dim=-1)[..., -1]
     out = (z / acc.unsqueeze(-1)).movedim(-1, dim)
     return out
 
@@ -107,11 +103,9 @@ def _deterministic_cdf(pdf: torch.Tensor,
     alloc = total - min_range * n
     num_sum = int(num.sum().item())
 
-    # base integer allocation
     base = (alloc * num) // num_sum
     remainder = int(alloc - int(base.sum().item()))
     if remainder > 0:
-        # deterministic priority: residual * (n+1) - index  (stable sort)
         prio = (alloc * num) - (num_sum * base)
         idx = torch.arange(n, device=num.device, dtype=torch.int64)
         key = prio * (n + 1) - idx
@@ -124,6 +118,76 @@ def _deterministic_cdf(pdf: torch.Tensor,
     if check:
         assert int(cdf[-1].item()) == total
         assert (ranges >= min_range).all()
+    return cdf
+
+def _deterministic_cdf_multi(pdf_mat: torch.Tensor,
+                             total_range_bits: int,
+                             fp_scale: int = FP_SCALE,
+                             min_range: int = MIN_RANGE,
+                             check: bool = False) -> torch.Tensor:
+    """
+    Vectorized version of `_deterministic_cdf` operating on a matrix of PDFs.
+    Expects shape `[B, K]` where `B` is number of bins and `K` is number of codebooks.
+    Returns integer CDFs with the same shape.
+    """
+    assert pdf_mat.dim() == 2, "pdf_mat must be 2D: [bins, K]"
+    pdf = pdf_mat.detach().to(torch.float64).clamp_min(0)
+    s = torch.sum(pdf, dim=0)
+    invalid = (~torch.isfinite(s)) | (s <= 0)
+    if bool(invalid.any()):
+        pdf[:, invalid] = 1.0
+
+    eq0 = (pdf[0:1, :] == pdf)
+    uniform_mask = torch.all(eq0, dim=0)
+
+    num = _counts_from_pdf(pdf, fp_scale).to(torch.int64)
+    zeros = torch.sum(num, dim=0) <= 0
+    if bool(zeros.any()):
+        num[:, zeros] = 1
+
+    total = 1 << total_range_bits
+    n_bins = int(num.size(0))
+    alloc = total - min_range * n_bins
+    num_sum = torch.sum(num, dim=0)
+
+    base = (alloc * num) // num_sum
+    base_sum = torch.sum(base, dim=0)
+    remainder = (alloc - base_sum).to(torch.int64)
+
+    if bool((remainder > 0).any()):
+        prio = (alloc * num) - (num_sum * base)
+        dev = num.device
+        dev_key = (dev.type, -1 if dev.index is None else int(dev.index), n_bins)
+        idx_row = _IDX_CACHE.get(dev_key)
+        if idx_row is None:
+            idx_row = torch.arange(n_bins, device=dev, dtype=torch.int64).unsqueeze(1)
+            _IDX_CACHE[dev_key] = idx_row
+        idx = idx_row.expand(n_bins, num.size(1))
+        key = prio * (n_bins + 1) - idx
+        order = torch.argsort(key, dim=0, descending=True, stable=True)
+        max_rem = int(torch.max(remainder).item())
+        if max_rem > 0:
+            top_idx = order[:max_rem, :]
+            row_range = torch.arange(max_rem, device=num.device, dtype=torch.int64).unsqueeze(1)
+            take_mask = (row_range < remainder.unsqueeze(0)).to(base.dtype)
+            base = base.scatter_add(0, top_idx, take_mask)
+
+    ranges = base + min_range
+    cdf = torch.cumsum(ranges, dim=0, dtype=torch.int64)
+
+    if bool(uniform_mask.any()):
+        dev = pdf.device
+        cache_key = (dev.type, -1 if dev.index is None else int(dev.index), n_bins, int(total_range_bits), int(min_range))
+        u_cdf = _UNIFORM_CDF_CACHE.get(cache_key)
+        if u_cdf is None:
+            u_pdf = torch.full((n_bins,), 1.0 / n_bins, dtype=torch.float64, device=dev)
+            u_cdf = _deterministic_cdf(u_pdf, total_range_bits, fp_scale=fp_scale, min_range=min_range, check=check)
+            _UNIFORM_CDF_CACHE[cache_key] = u_cdf
+        cdf[:, uniform_mask] = u_cdf.unsqueeze(1)
+
+    if check:
+        assert torch.all(cdf[-1, :] == total)
+        assert torch.all(ranges >= min_range)
     return cdf
 
 
@@ -148,7 +212,8 @@ def compress_to_file(model: EncodecModel, wav: torch.Tensor, fo: tp.IO[bytes],
 
     coder_device = torch.device("cpu")
 
-    with torch.no_grad():
+    model = model.eval()
+    with torch.inference_mode():
         frames = model.encode(wav[None])
     codes0, _ = frames[0]
     _, K, _ = codes0.shape
@@ -182,16 +247,19 @@ def compress_to_file(model: EncodecModel, wav: torch.Tensor, fo: tp.IO[bytes],
 
         for t in range(T):
             if use_lm:
-                with torch.no_grad():
+                with torch.inference_mode():
                     logits_raw, states, offset = lm.forward_logits(input_, states, offset)
                     logits_q = _quantize_logits_(logits_raw / lm.tau, LOGIT_QSTEP)
                     probas = _softmax_or_uniform(logits_q, dim=1)
 
+                pdf_mat = probas[0, :, :, 0].to(coder_device)
+                cdf_mat = _deterministic_cdf_multi(pdf_mat, coder.total_range_bits, fp_scale=FP_SCALE, check=False)
+                cdf_cols = cdf_mat.t().contiguous()
+
                 frame_slice = frame[:, :, t: t + 1].detach().to(coder_device)
                 values = frame_slice[0, :, 0].tolist()
                 for k, value in enumerate(values):
-                    q_cdf = _deterministic_cdf(probas[0, :, k, 0], coder.total_range_bits, fp_scale=FP_SCALE, check=False)
-                    coder.push(value, q_cdf)
+                    coder.push(value, cdf_cols[k])
                 input_ = 1 + frame_slice
             else:
                 values = frame[0, :, t].detach().cpu().tolist()
@@ -225,7 +293,7 @@ def decompress_from_file(fo: tp.IO[bytes], device='cpu') -> tp.Tuple[torch.Tenso
     if acv != 3:
         raise ValueError("Unsupported bitstream version; re-encode with this coder.")
 
-    model = MODELS[model_name]().to(device)
+    model = MODELS[model_name]().to(device).eval()
     model_device = next(model.parameters()).device
     coder_device = torch.device("cpu")
 
@@ -259,15 +327,18 @@ def decompress_from_file(fo: tp.IO[bytes], device='cpu') -> tp.Tuple[torch.Tenso
 
         for t in range(frame_length):
             if use_lm:
-                with torch.no_grad():
+                with torch.inference_mode():
                     logits_raw, states, offset = lm.forward_logits(input_, states, offset)
                     logits_q = _quantize_logits_(logits_raw / lm.tau, LOGIT_QSTEP)
                     probas = _softmax_or_uniform(logits_q, dim=1)
 
+                pdf_mat = probas[0, :, :, 0].to(coder_device)
+                cdf_mat = _deterministic_cdf_multi(pdf_mat, decoder.total_range_bits, fp_scale=fp_scale, min_range=MIN_RANGE, check=False)
+                cdf_cols = cdf_mat.t().contiguous()
+
                 code_list: tp.List[int] = []
                 for k in range(num_codebooks):
-                    q_cdf = _deterministic_cdf(probas[0, :, k, 0], decoder.total_range_bits, fp_scale=fp_scale, check=False)
-                    code = decoder.pull(q_cdf)
+                    code = decoder.pull(cdf_cols[k])
                     if code is None:
                         raise EOFError("The stream ended sooner than expected.")
                     code_list.append(code)
@@ -284,7 +355,7 @@ def decompress_from_file(fo: tp.IO[bytes], device='cpu') -> tp.Tuple[torch.Tenso
 
         frames.append((frame.to(model_device), None if scale is None else scale.to(model_device)))
 
-    with torch.no_grad():
+    with torch.inference_mode():
         wav = model.decode(frames)
     return wav[0, :, :audio_length], model.sample_rate
 
@@ -318,6 +389,7 @@ def decompress(compressed: bytes, device='cpu') -> tp.Tuple[torch.Tensor, int]:
 
 def test():
     import torchaudio
+    import time
     torch.set_num_threads(1)
     for name in MODELS.keys():
         model = MODELS[name]()
@@ -340,3 +412,4 @@ def test():
 
 if __name__ == '__main__':
     test()
+
