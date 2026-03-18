@@ -185,6 +185,45 @@ Interpretation:
 - This is a small but real compression gain of about `1%` on the chunked entropy path.
 - The gain comes from better integer CDF resolution rather than any model change.
 
+### Grouped Entropy Chunks
+
+The strongest no-retrain compression gain after the CDF tuning pass came from reducing how often the entropy coder resets while keeping the model segment schedule unchanged.
+
+- Added `ENCODEC_ENTROPY_GROUP_FRAMES`
+- The model still encodes/decode frames at the normal segment size
+- Multiple model frames can now share a single arithmetic-coded chunk
+- This preserves clean decode quality, but expands the corruption containment window to the entropy group size
+
+On the 4-second `AFTER DARK` clip, `1.0s` model segments:
+
+- `eg=1`: `1821 bytes`, `3642 bps`
+- `eg=2`: `1788 bytes`, `3576 bps`
+- `eg=4`: `1779 bytes`, `3558 bps`
+- `eg=8`: `1763 bytes`, `3526 bps`
+
+On the 3-clip, 6-second sweep, `1.0s` model segments:
+
+- `eg=1`: average `4104.0 bps`
+- `eg=2`: average `4039.1 bps`
+- `eg=4`: average `4006.2 bps`
+
+Interpretation:
+
+- `eg=2` is a meaningful compression win of about `65 bps` average versus `eg=1`
+- `eg=4` pushes further, but at a steeper resilience cost
+- This is the most effective compression-only lever found so far that does not require retraining
+
+Corruption containment on the same 4-second clip:
+
+- `eg=2`: damaged region about `1.99s`
+- `eg=4`: damaged region about `3.97s`
+
+Interpretation:
+
+- `eg=2` is a plausible compression-first mode
+- `eg=1` remains the resilience-first mode
+- `eg=4+` is clearly moving away from the original bounded-failure goal
+
 ### Corruption Targeting And Current Readout
 
 After fixing the harness to corrupt actual `acv=4` chunk bodies:
@@ -206,10 +245,11 @@ Interpretation:
 
 1. Recover LM efficiency without losing the `mps -> cpu` fix.
 2. Resolve the remaining cross-host corruption comparison inconsistency for `1.0s` chunks.
-3. Decide whether `0.5s` is worth the bitrate tradeoff, or whether we should keep `1.0s` model chunks and look for finer-grained entropy chunking.
-4. Reduce `acv=4` overhead by tightening chunk headers or making CRC optional.
-5. Speed up chunked decode, which currently pays extra per-segment decode overhead.
-6. Add automated tests for:
+3. Decide whether `eg=2` should become the default for a compression-first mode while keeping `eg=1` as the resilience-first mode.
+4. Decide whether `0.5s` is worth the bitrate tradeoff, or whether we should keep `1.0s` model chunks and look for finer-grained entropy chunking.
+5. Reduce `acv=4` overhead by tightening chunk headers or making CRC optional.
+6. Speed up chunked decode, which currently pays extra per-segment decode overhead.
+7. Add automated tests for:
    - legacy decode
    - `mps -> cpu` decode
    - Mac `cpu/mps` -> Linux `cpu/cuda` decode
