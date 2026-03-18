@@ -87,8 +87,8 @@ The deterministic branch now defaults to:
 - `ENCODEC_DETERMINISTIC_LM_DTYPE=float32`
 - `ENCODEC_LOGIT_QSTEP=1/128`
 - `ENCODEC_LM_TAU=1.0`
-- `ENCODEC_AC_FP_SCALE=8192`
-- `ENCODEC_AC_MIN_RANGE=2`
+- `ENCODEC_AC_FP_SCALE=65536`
+- `ENCODEC_AC_MIN_RANGE=1`
 - `ENCODEC_USE_NEAR_UNIFORM=0`
 
 These settings performed better than the more conservative profile while keeping the `mps -> cpu` decode fix.
@@ -155,7 +155,7 @@ Interpretation:
 
 On `AFTER DARK`, 4 seconds, `encodec_48khz`, `6 kbps`, LM:
 
-- `1.0s` chunks, Mac CPU: `3654 bps`, encode `1.328s`, decode `1.466s`
+- `1.0s` chunks, Mac CPU: `3624 bps`, encode `2.092s`, decode `2.301s`
 - `0.5s` chunks, Mac CPU: `4056 bps`, encode `1.192s`, decode `0.667s`
 - `0.25s` chunks, Mac CPU: `4618 bps`, encode `1.330s`, decode `0.402s`
 - `0.5s` chunks, Mac MPS: `4056 bps`, encode `2.730s`, decode `0.720s`
@@ -165,6 +165,25 @@ Interpretation:
 - `0.25s` is too expensive in bitrate for the current design.
 - `0.5s` is a plausible next point if we want stronger containment, but it costs about `+402 bps` versus `1.0s` on this clip.
 - The overhead increase is dominated by segmentation behavior, not the `8-byte` per-chunk framing.
+
+### Latest Compression Improvement
+
+Without retraining or changing the file format, increasing deterministic CDF precision improved chunked LM compression:
+
+- Candidate settings tested:
+  - `ENCODEC_AC_FP_SCALE=65536`
+  - `ENCODEC_AC_MIN_RANGE=1`
+- On the 4-second `AFTER DARK` clip with `1.0s` chunks:
+  - previous default: `1827 bytes`, `3654 bps`
+  - current default: `1812 bytes`, `3624 bps`
+- On a 3-clip, 6-second sweep with `1.0s` chunks:
+  - previous average: `4133.8 bps`
+  - current average: `4092.0 bps`
+
+Interpretation:
+
+- This is a small but real compression gain of about `1%` on the chunked entropy path.
+- The gain comes from better integer CDF resolution rather than any model change.
 
 ### Corruption Targeting And Current Readout
 

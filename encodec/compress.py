@@ -51,8 +51,8 @@ def _env_bool(name: str, default: bool) -> bool:
 
 LOGIT_QSTEP = _env_float("ENCODEC_LOGIT_QSTEP", 1.0 / 128.0)
 LM_TAU = _env_float("ENCODEC_LM_TAU", 1.0)
-FP_SCALE = _env_int("ENCODEC_AC_FP_SCALE", 1 << 13)
-MIN_RANGE = _env_int("ENCODEC_AC_MIN_RANGE", 2)
+FP_SCALE = _env_int("ENCODEC_AC_FP_SCALE", 1 << 16)
+MIN_RANGE = _env_int("ENCODEC_AC_MIN_RANGE", 1)
 USE_NEAR_UNIFORM = _env_bool("ENCODEC_USE_NEAR_UNIFORM", False)
 
 
