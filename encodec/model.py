@@ -32,10 +32,12 @@ class LMModel(nn.Module):
         n_q (int): number of codebooks.
         card (int): codebook cardinality.
         dim (int): transformer dimension.
+        tau (float): softmax temperature. 1.0 = no smoothing (optimal compression).
+            Higher values soften the distribution (more robust but worse compression).
         **kwargs: passed to `encodec.modules.transformer.StreamingTransformerEncoder`.
     """
-class LMModel(nn.Module):
-    def __init__(self, n_q: int = 32, card: int = 1024, dim: int = 200, dtype=torch.float64, **kwargs):
+    def __init__(self, n_q: int = 32, card: int = 1024, dim: int = 200, dtype=torch.float64,
+                 tau: float = 1.0, **kwargs):
         super().__init__()
         self.card = card
         self.n_q = n_q
@@ -45,7 +47,7 @@ class LMModel(nn.Module):
         self.emb = nn.ModuleList([nn.Embedding(card + 1, dim, dtype=dtype) for _ in range(n_q)])
         self.linears = nn.ModuleList([nn.Linear(dim, card, dtype=dtype) for _ in range(n_q)])
         self.logit_step = 1.0 / 64.0
-        self.tau = 2.0
+        self.tau = tau
 
     def forward_logits(self, indices: torch.Tensor,
                        states: tp.Optional[tp.List[torch.Tensor]] = None, offset: int = 0):
@@ -61,6 +63,13 @@ class LMModel(nn.Module):
         logits = torch.round(logits / self.logit_step) * self.logit_step
         probas = torch.softmax(logits / self.tau, dim=1)
         return probas, states, offset
+
+    def forward_legacy(self, indices: torch.Tensor,
+                       states: tp.Optional[tp.List[torch.Tensor]] = None, offset: int = 0):
+        """Legacy path: raw softmax with no quantisation, for acv<3 streams."""
+        logits, states, offset = self.forward_logits(indices, states, offset)
+        return torch.softmax(logits, dim=1), states, offset
+
 
 class EncodecModel(nn.Module):
     """EnCodec model operating on the raw waveform.
@@ -193,12 +202,24 @@ class EncodecModel(nn.Module):
                              f"Select one of {self.target_bandwidths}.")
         self.bandwidth = bandwidth
 
-    def get_lm_model(self, int8: bool = False) -> LMModel:
-        device = torch.device("cpu")
+    def get_lm_model(self,
+                     device: tp.Optional[torch.device] = None,
+                     dtype: torch.dtype = torch.float32) -> LMModel:
+        """Load the pre-trained language model for entropy coding.
+
+        Args:
+            device: target device (defaults to CPU — LM must stay on CPU for
+                    cross-platform arithmetic-coder determinism).
+            dtype: LM weight dtype.  float32 is faster and sufficient when
+                   combined with the deterministic logit-quantisation path.
+        """
+        device = torch.device("cpu") if device is None else device
         lm = LMModel(self.quantizer.n_q, self.quantizer.bins, num_layers=5, dim=200,
-                    past_context=int(3.5 * self.frame_rate), dtype=torch.float64).to(device)
-        checkpoints = {'encodec_24khz': 'encodec_lm_24khz-1608e3c0.th',
-                    'encodec_48khz': 'encodec_lm_48khz-7add9fc3.th'}
+                     past_context=int(3.5 * self.frame_rate), dtype=dtype).to(device)
+        checkpoints = {
+            'encodec_24khz': 'encodec_lm_24khz-1608e3c0.th',
+            'encodec_48khz': 'encodec_lm_48khz-7add9fc3.th',
+        }
         checkpoint_name = checkpoints[self.name]
         url = _get_checkpoint_url(ROOT_URL, checkpoint_name)
         state = torch.hub.load_state_dict_from_url(url, map_location='cpu', check_hash=True)
