@@ -362,7 +362,7 @@ def decompress_from_file(fo: tp.IO[bytes], device='cpu') -> tp.Tuple[torch.Tenso
     if use_lm and acv >= 3:
         lm = model.get_lm_model(device=coder_device, dtype=DETERMINISTIC_LM_DTYPE).eval()
     elif use_lm:
-        legacy_lm = model.get_lm_model(device=model_device, dtype=torch.float32).eval()
+        legacy_lm = model.get_lm_model(device=coder_device, dtype=torch.float32).eval()
 
     segment_length = model.segment_length or audio_length
     segment_stride = model.segment_stride or audio_length
@@ -405,7 +405,13 @@ def decompress_from_file(fo: tp.IO[bytes], device='cpu') -> tp.Tuple[torch.Tenso
                         probas = _softmax_or_uniform(logits_q, dim=1)
 
                     pdf_mat = probas[0, :, :, 0].to(coder_device)
-                    cdf_mat = _deterministic_cdf_multi(pdf_mat, decoder.total_range_bits, fp_scale=fp_scale, min_range=min_range, check=False)
+                    cdf_mat = _deterministic_cdf_multi(
+                        pdf_mat,
+                        decoder.total_range_bits,
+                        fp_scale=fp_scale,
+                        min_range=min_range,
+                        check=False,
+                    )
                     cdf_cols = cdf_mat.t().contiguous()
 
                     code_list: tp.List[int] = []
@@ -418,7 +424,7 @@ def decompress_from_file(fo: tp.IO[bytes], device='cpu') -> tp.Tuple[torch.Tenso
                     input_ = 1 + frame[:, :, t: t + 1]
                 elif use_lm:
                     with torch.inference_mode():
-                        probas, states, offset = legacy_lm.forward_legacy(input_.to(model_device), states, offset)
+                        probas, states, offset = legacy_lm.forward_legacy(input_, states, offset)
                     code_list = []
                     for k in range(num_codebooks):
                         q_cdf = build_stable_quantized_cdf(

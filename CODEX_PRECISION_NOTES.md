@@ -14,6 +14,17 @@ All work for this thread stays in `/Users/jamieb/wavey.ai/codex/encodec-codex`.
 - Test corpus: `~/Downloads/Lori EP`
 - Primary comparison model: `encodec_48khz`, `6 kbps`
 
+### Cross-host Validation Environment
+
+- Source host: Apple Silicon Mac, tested on both `cpu` and `mps`
+- Decode host: Linode `g2-gpu-rtx4000a1-s`
+- Region: `de-fra-2`
+- GPU: `NVIDIA RTX 4000 Ada Generation`
+- Remote OS: Ubuntu `24.04.3`
+- Remote Python: `3.10.20`
+- Remote Torch: `2.6.0+cu124`
+- Remote Torchaudio: `2.6.0+cu124`
+
 ## Findings So Far
 
 ### Confirmed
@@ -56,6 +67,11 @@ Interpretation:
   - LM vs non-LM
   - segment size effects
   - single-byte corruption behavior
+- Extended `scripts/precision_eval.py` so it can:
+  - write clean payloads directly
+  - write the corrupted payload it actually tested
+  - target chunk body bytes for `acv=4` instead of accidentally flipping chunk headers or CRC bytes
+- Added `scripts/payload_decode_matrix.py` to decode payloads across `cpu` and `cuda` and compare clean/corrupt pairs on a second host
 - Parameterized deterministic coder settings via env vars:
   - `ENCODEC_DETERMINISTIC_LM_DTYPE`
   - `ENCODEC_LOGIT_QSTEP`
@@ -115,14 +131,68 @@ Interpretation:
 - The extra chunk framing overhead is modest.
 - We now have actual failure containment aligned with segment size, not just a design intention.
 
+### Cross-host Mac -> Linux Decode Matrix
+
+Using payloads encoded on the Mac and decoded on the Linode box:
+
+- Baseline legacy payloads:
+  - Mac `cpu` -> Linux `cpu`: fail with `EOFError`
+  - Mac `cpu` -> Linux `cuda`: fail with `EOFError`
+  - Mac `mps` -> Linux `cpu`: fail with `EOFError`
+  - Mac `mps` -> Linux `cuda`: fail with `EOFError`
+- Current deterministic `acv=4` payloads:
+  - Mac `cpu` -> Linux `cpu`: success
+  - Mac `cpu` -> Linux `cuda`: success
+  - Mac `mps` -> Linux `cpu`: success
+  - Mac `mps` -> Linux `cuda`: success
+
+Interpretation:
+
+- The deterministic entropy path is now robust across host architecture and device changes.
+- Keeping the arithmetic path on CPU while allowing model decode on CUDA is the right split for cross-host determinism.
+
+### Chunk Size Sweep
+
+On `AFTER DARK`, 4 seconds, `encodec_48khz`, `6 kbps`, LM:
+
+- `1.0s` chunks, Mac CPU: `3654 bps`, encode `1.328s`, decode `1.466s`
+- `0.5s` chunks, Mac CPU: `4056 bps`, encode `1.192s`, decode `0.667s`
+- `0.25s` chunks, Mac CPU: `4618 bps`, encode `1.330s`, decode `0.402s`
+- `0.5s` chunks, Mac MPS: `4056 bps`, encode `2.730s`, decode `0.720s`
+
+Interpretation:
+
+- `0.25s` is too expensive in bitrate for the current design.
+- `0.5s` is a plausible next point if we want stronger containment, but it costs about `+402 bps` versus `1.0s` on this clip.
+- The overhead increase is dominated by segmentation behavior, not the `8-byte` per-chunk framing.
+
+### Corruption Targeting And Current Readout
+
+After fixing the harness to corrupt actual `acv=4` chunk bodies:
+
+- Local Mac decode, `1.0s` chunks:
+  - corruption landed in chunk index `1`
+  - damaged region about `0.998s`
+- Local Mac decode, `0.5s` chunks:
+  - corruption landed in chunk index `4`
+  - damaged region about `0.040s`
+
+Interpretation:
+
+- The `1.0s` result matches the design goal of containing a catastrophic failure to about one chunk.
+- The `0.5s` result needs more inspection. The affected region was much smaller than the nominal chunk size, which suggests the chosen chunk landed late in the stream schedule or the actual audible effect is smaller than the full chunk substitution window.
+- One unresolved inconsistency remains: the Linux clean/corrupt pair comparison for the `1.0s` corrupted payload reported zero waveform delta even though the local harness measured the expected one-chunk effect. The payload bytes are definitely different on both hosts, so this needs a targeted follow-up.
+
 ## Next Iteration Targets
 
 1. Recover LM efficiency without losing the `mps -> cpu` fix.
-2. Benchmark smaller chunk sizes such as `0.5s` and `0.25s` under `acv=4` now that framing exists.
-3. Reduce `acv=4` overhead by tightening chunk headers or making CRC optional.
-4. Speed up chunked decode, which currently pays extra per-segment decode overhead.
-5. Add automated tests for:
+2. Resolve the remaining cross-host corruption comparison inconsistency for `1.0s` chunks.
+3. Decide whether `0.5s` is worth the bitrate tradeoff, or whether we should keep `1.0s` model chunks and look for finer-grained entropy chunking.
+4. Reduce `acv=4` overhead by tightening chunk headers or making CRC optional.
+5. Speed up chunked decode, which currently pays extra per-segment decode overhead.
+6. Add automated tests for:
    - legacy decode
    - `mps -> cpu` decode
+   - Mac `cpu/mps` -> Linux `cpu/cuda` decode
    - chunk corruption fallback
    - no-LM regression coverage

@@ -3,6 +3,7 @@ import argparse
 import io
 import json
 import math
+import struct
 import sys
 import time
 from pathlib import Path
@@ -26,6 +27,8 @@ def parse_args():
     parser.add_argument("--duration", type=float, default=None, help="Clip duration in seconds.")
     parser.add_argument("--corrupt-byte-fraction", type=float, default=None, help="Flip one byte near this fraction of the payload.")
     parser.add_argument("--corrupt-byte-index", type=int, default=None, help="Flip one byte at this absolute payload index.")
+    parser.add_argument("--output-payload", type=Path, default=None, help="Optional path to write the encoded payload.")
+    parser.add_argument("--output-corrupt-payload", type=Path, default=None, help="Optional path to write the corrupted payload.")
     return parser.parse_args()
 
 
@@ -48,6 +51,53 @@ def flip_payload_byte(payload: bytes, metadata_len: int, byte_index: int):
         raise ValueError(f"Corruption index {byte_index} is out of range for payload of {len(data) - metadata_len} bytes.")
     data[target] ^= 0x01
     return bytes(data), target
+
+
+def flip_chunk_body_byte(payload: bytes, metadata_len: int, metadata: dict, byte_index: int | None, fraction: float | None):
+    chunk_header = struct.Struct("!II")
+    data = bytearray(payload)
+    stream = io.BytesIO(payload)
+    stream.seek(metadata_len)
+
+    body_ranges = []
+    while stream.tell() < len(payload):
+        header_pos = stream.tell()
+        header = stream.read(chunk_header.size)
+        if len(header) != chunk_header.size:
+            break
+        chunk_len, _chunk_crc = chunk_header.unpack(header)
+        body_start = stream.tell()
+        body_end = body_start + chunk_len
+        if body_end > len(payload):
+            break
+        body_ranges.append((body_start, body_end, header_pos))
+        stream.seek(body_end)
+
+    if not body_ranges:
+        raise ValueError("No chunk bodies found in payload.")
+
+    total_body_bytes = sum(end - start for start, end, _ in body_ranges)
+    if byte_index is not None:
+        remaining = byte_index
+    else:
+        assert fraction is not None
+        remaining = min(total_body_bytes - 1, max(0, int(math.floor(total_body_bytes * fraction))))
+
+    chunk_index = 0
+    target = None
+    for idx, (start, end, _header_pos) in enumerate(body_ranges):
+        chunk_len = end - start
+        if remaining < chunk_len:
+            target = start + remaining
+            chunk_index = idx
+            break
+        remaining -= chunk_len
+
+    if target is None or target >= len(data):
+        raise ValueError("Corruption index is out of range for chunk bodies.")
+
+    data[target] ^= 0x01
+    return bytes(data), target, chunk_index, target - body_ranges[chunk_index][0]
 
 
 def main():
@@ -77,18 +127,36 @@ def main():
     clean_payload = compress(model, wav_in, use_lm=args.lm)
     encode_s = time.perf_counter() - t0
 
+    if args.output_payload is not None:
+        args.output_payload.parent.mkdir(parents=True, exist_ok=True)
+        args.output_payload.write_bytes(clean_payload)
+
     payload = clean_payload
     header_stream = io.BytesIO(clean_payload)
     metadata = binary.read_ecdc_header(header_stream)
     payload_offset = header_stream.tell()
 
     corrupt_abs = None
+    corrupt_chunk_index = None
+    corrupt_chunk_byte = None
     if args.corrupt_byte_index is not None:
-        payload, corrupt_abs = flip_payload_byte(payload, payload_offset, args.corrupt_byte_index)
+        if metadata.get("acv") == 4:
+            payload, corrupt_abs, corrupt_chunk_index, corrupt_chunk_byte = flip_chunk_body_byte(
+                payload, payload_offset, metadata, args.corrupt_byte_index, None)
+        else:
+            payload, corrupt_abs = flip_payload_byte(payload, payload_offset, args.corrupt_byte_index)
     elif args.corrupt_byte_fraction is not None:
-        data_len = len(clean_payload) - payload_offset
-        corrupt_idx = min(data_len - 1, max(0, int(math.floor(data_len * args.corrupt_byte_fraction))))
-        payload, corrupt_abs = flip_payload_byte(payload, payload_offset, corrupt_idx)
+        if metadata.get("acv") == 4:
+            payload, corrupt_abs, corrupt_chunk_index, corrupt_chunk_byte = flip_chunk_body_byte(
+                payload, payload_offset, metadata, None, args.corrupt_byte_fraction)
+        else:
+            data_len = len(clean_payload) - payload_offset
+            corrupt_idx = min(data_len - 1, max(0, int(math.floor(data_len * args.corrupt_byte_fraction))))
+            payload, corrupt_abs = flip_payload_byte(payload, payload_offset, corrupt_idx)
+
+    if args.output_corrupt_payload is not None:
+        args.output_corrupt_payload.parent.mkdir(parents=True, exist_ok=True)
+        args.output_corrupt_payload.write_bytes(payload)
 
     result = {
         "repo_path": str(args.repo_path),
@@ -108,9 +176,13 @@ def main():
         "encoded_samples": int(wav_in.shape[-1]),
         "encoded_bytes": len(clean_payload),
         "payload_bytes": len(clean_payload) - payload_offset,
+        "output_payload": None if args.output_payload is None else str(args.output_payload),
+        "output_corrupt_payload": None if args.output_corrupt_payload is None else str(args.output_corrupt_payload),
         "header_metadata": metadata,
         "corrupt_absolute_byte": corrupt_abs,
         "corrupt_payload_byte": None if corrupt_abs is None else corrupt_abs - payload_offset,
+        "corrupt_chunk_index": corrupt_chunk_index,
+        "corrupt_chunk_byte": corrupt_chunk_byte,
     }
 
     try:
