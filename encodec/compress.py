@@ -62,6 +62,16 @@ def _env_dtype(name: str, default: torch.dtype) -> torch.dtype:
     except KeyError as exc:
         raise ValueError(f"Unsupported dtype override {v!r} for {name}.") from exc
 
+def _env_choice(name: str, default: str, choices: tp.Set[str]) -> str:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    value = v.lower()
+    if value not in choices:
+        allowed = ", ".join(sorted(choices))
+        raise ValueError(f"Unsupported value {v!r} for {name}. Expected one of: {allowed}.")
+    return value
+
 # Lean defaults: float32 LM, finer logit grid, high-precision CDF allocation.
 LOGIT_QSTEP          = _env_float("ENCODEC_LOGIT_QSTEP", 1.0 / 128.0)
 LM_TAU               = _env_float("ENCODEC_LM_TAU", 1.0)
@@ -69,10 +79,13 @@ FP_SCALE             = _env_int("ENCODEC_AC_FP_SCALE", 1 << 16)
 MIN_RANGE            = _env_int("ENCODEC_AC_MIN_RANGE", 1)
 USE_NEAR_UNIFORM     = _env_bool("ENCODEC_USE_NEAR_UNIFORM", False)
 DETERMINISTIC_LM_DTYPE = _env_dtype("ENCODEC_DETERMINISTIC_LM_DTYPE", torch.float32)
+LM_DEVICE_MODE       = _env_choice("ENCODEC_LM_DEVICE", "cpu", {"cpu", "model"})
+LM_CHUNKED_DEFAULT   = _env_bool("ENCODEC_LM_CHUNKED", True)
 
 _IDX_CACHE: tp.Dict[tp.Tuple[str, int, int], torch.Tensor] = {}
 _UNIFORM_CDF_CACHE: tp.Dict[tp.Tuple[str, int, int, int, int], torch.Tensor] = {}
 _CHUNK_HEADER = struct.Struct('!II')   # chunk_len (uint32 BE), crc32 (uint32 BE)
+ProgressCallback = tp.Optional[tp.Callable[[tp.Dict[str, tp.Any]], None]]
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +261,48 @@ def _deterministic_cdf_multi(pdf_mat: torch.Tensor,
 # acv=4 chunk framing helpers
 # ---------------------------------------------------------------------------
 
+def _emit_progress(progress_callback: ProgressCallback, payload: tp.Dict[str, tp.Any]) -> None:
+    if progress_callback is None:
+        return
+    try:
+        progress_callback(payload)
+    except Exception:
+        # Progress reporting must never affect deterministic bytestream generation.
+        pass
+
+
+def _segment_layout(model: EncodecModel, audio_length: int) -> tp.Tuple[int, int, tp.List[int]]:
+    segment_length = model.segment_length or audio_length
+    segment_stride = model.segment_stride or audio_length
+    offsets = list(range(0, audio_length, segment_stride))
+    return segment_length, segment_stride, offsets
+
+
+def _build_progress_payload(
+    *,
+    stage: str,
+    sample_rate: int,
+    total_segments: int,
+    segment_index: int,
+    audio_length: int,
+    segment_length: int,
+    segment_stride: int,
+    offset_samples: int = 0,
+) -> tp.Dict[str, tp.Any]:
+    payload: tp.Dict[str, tp.Any] = {
+        'stage': stage,
+        'segmentCount': total_segments,
+        'segmentIndex': segment_index,
+        'progress': float(segment_index / total_segments) if total_segments else 0.0,
+        'sampleRate': int(sample_rate),
+        'audioLength': audio_length,
+        'segmentLength': int(segment_length),
+        'segmentStride': int(segment_stride),
+    }
+    if stage == 'segment':
+        payload['offsetSamples'] = int(offset_samples)
+    return payload
+
 def _write_chunk(fo: tp.IO[bytes], payload: bytes) -> None:
     """Write a CRC-protected chunk: [len: u32][crc: u32][payload]."""
     fo.write(_CHUNK_HEADER.pack(len(payload), zlib.crc32(payload) & 0xffffffff))
@@ -268,95 +323,221 @@ def _read_chunk_payload(fo: tp.IO[bytes]) -> bytes:
 # compress_to_file / decompress_from_file
 # ---------------------------------------------------------------------------
 
+def _write_frame_payload(
+    frame: torch.Tensor,
+    scale: tp.Optional[torch.Tensor],
+    fo: tp.IO[bytes],
+    *,
+    use_lm: bool,
+    model: EncodecModel,
+    coder_device: torch.device,
+    lm_device: torch.device,
+    lm: tp.Optional[tp.Any],
+    lm_tau: float,
+) -> None:
+    if scale is not None:
+        fo.write(struct.pack('!f', float(scale.cpu().item())))
+
+    _B, K, T = frame.shape
+    if use_lm:
+        assert lm is not None
+        coder = ArithmeticCoder(fo)
+        states = None
+        offset = 0
+        input_ = torch.zeros(1, K, 1, dtype=torch.long, device=lm_device)
+    else:
+        packer = binary.BitPacker(model.bits_per_codebook, fo)
+
+    for t in range(T):
+        if use_lm:
+            with torch.inference_mode():
+                logits_raw, states, offset = lm.forward_logits(input_, states, offset)
+                logits_q = _quantize_logits_(logits_raw / lm_tau, LOGIT_QSTEP)
+                probas = _softmax_or_uniform(logits_q, dim=1)
+
+            pdf_mat = probas[0, :, :, 0].to(coder_device)
+            cdf_mat = _deterministic_cdf_multi(
+                pdf_mat, coder.total_range_bits,
+                fp_scale=FP_SCALE, min_range=MIN_RANGE, check=False)
+            cdf_cols = cdf_mat.t().contiguous()
+
+            frame_slice = frame[:, :, t:t + 1].detach().to(coder_device)
+            for k, value in enumerate(frame_slice[0, :, 0].tolist()):
+                coder.push(value, cdf_cols[k])
+            input_ = (1 + frame_slice).to(lm_device)
+        else:
+            for value in frame[0, :, t].detach().cpu().tolist():
+                packer.push(value)
+
+    if use_lm:
+        coder.flush()
+    else:
+        packer.flush()
+
+
 def compress_to_file(model: EncodecModel, wav: torch.Tensor, fo: tp.IO[bytes],
-                     use_lm: bool = True) -> None:
+                     use_lm: bool = True,
+                     progress_callback: ProgressCallback = None,
+                     lm_chunked: tp.Optional[bool] = None) -> None:
     """Compress a waveform to a file-object.
 
-    When ``use_lm=True`` the stream is bitstream version 4 (acv=4):
-    each model segment is wrapped in a CRC-protected chunk so that a
-    single corrupt byte only damages that one segment (~1 s).  The
-    arithmetic coder and LM always run on CPU for cross-platform
-    determinism; the EnCodec model may run on any device.
+    When ``use_lm=True``:
+      * ``lm_chunked=True`` writes bitstream version 4 (acv=4), where
+        each model segment is wrapped in a CRC-protected chunk.
+      * ``lm_chunked=False`` writes deterministic unchunked bitstream
+        version 3 (acv=3), compatible with the existing deterministic
+        decoder path.
+
+    The arithmetic coder and LM always run on CPU for cross-platform
+    determinism unless ``ENCODEC_LM_DEVICE=model`` is set. The EnCodec
+    model itself may run on any device.
 
     Args:
         model: pre-trained EncodecModel.
         wav: ``[C, T]`` waveform at model.sample_rate.
         fo: writable file-object.
-        use_lm: enable LM entropy coding (acv=4) vs raw bitpacking (acv=0).
+        use_lm: enable LM entropy coding.
+        lm_chunked: choose CRC chunk framing for deterministic LM streams.
     """
     assert wav.dim() == 2
     if model.name not in MODELS:
         raise ValueError(f"Unsupported model {model.name}.")
 
-    coder_device = torch.device("cpu")
+    if lm_chunked is None:
+        lm_chunked = LM_CHUNKED_DEFAULT
+
     model = model.eval()
     model_device = next(model.parameters()).device
-    with torch.inference_mode():
-        frames = model.encode(wav[None].to(model_device))
-    codes0, _ = frames[0]
-    _, K, _ = codes0.shape
+    coder_device = torch.device("cpu")
+    lm_device = model_device if LM_DEVICE_MODE == "model" else coder_device
+    audio_length = int(wav.shape[-1])
+    segment_length, segment_stride, offsets = _segment_layout(model, audio_length)
+
+    if not offsets:
+        raise ValueError("Cannot compress an empty waveform.")
 
     lm = None
     lm_tau = LM_TAU
-    if use_lm:
-        lm = model.get_lm_model(device=coder_device,
-                                dtype=DETERMINISTIC_LM_DTYPE).eval()
+    total_segments = len(offsets)
+    _emit_progress(progress_callback, _build_progress_payload(
+        stage='start',
+        sample_rate=int(model.sample_rate),
+        total_segments=total_segments,
+        segment_index=0,
+        audio_length=audio_length,
+        segment_length=segment_length,
+        segment_stride=segment_stride,
+    ))
+
+    if use_lm and not lm_chunked:
+        with torch.inference_mode():
+            frames = model.encode(wav[None].to(model_device))
+        if not frames:
+            raise ValueError("Cannot compress an empty waveform.")
+
+        codes0, _ = frames[0]
+        _, K, _ = codes0.shape
+        lm = model.get_lm_model(device=lm_device, dtype=DETERMINISTIC_LM_DTYPE).eval()
         lm.tau = lm_tau
+        metadata: tp.Dict[str, tp.Any] = {
+            'm':   model.name,
+            'al':  audio_length,
+            'nc':  int(K),
+            'lm':  True,
+            'fp':  int(FP_SCALE),
+            'mr':  int(MIN_RANGE),
+            'acv': 3,
+            'tau': float(lm_tau),
+        }
+        binary.write_ecdc_header(fo, metadata)
 
-    metadata: tp.Dict[str, tp.Any] = {
-        'm':   model.name,
-        'al':  int(wav.shape[-1]),
-        'nc':  int(K),
-        'lm':  bool(use_lm),
-        'fp':  int(FP_SCALE),
-        'mr':  int(MIN_RANGE),
-        'acv': 4 if use_lm else 0,
-        'tau': float(lm_tau),
-    }
-    binary.write_ecdc_header(fo, metadata)
+        for segment_index, ((frame, scale), offset_samples) in enumerate(zip(frames, offsets), start=1):
+            _write_frame_payload(
+                frame,
+                scale,
+                fo,
+                use_lm=True,
+                model=model,
+                coder_device=coder_device,
+                lm_device=lm_device,
+                lm=lm,
+                lm_tau=lm_tau,
+            )
+            _emit_progress(progress_callback, _build_progress_payload(
+                stage='segment',
+                sample_rate=int(model.sample_rate),
+                total_segments=total_segments,
+                segment_index=segment_index,
+                audio_length=audio_length,
+                segment_length=segment_length,
+                segment_stride=segment_stride,
+                offset_samples=int(offset_samples),
+            ))
+        return
 
-    for (frame, scale) in frames:
-        chunk_fo = io.BytesIO()
+    header_written = False
+    for segment_index, offset_samples in enumerate(offsets, start=1):
+        with torch.inference_mode():
+            segment_wav = wav[None, :, offset_samples: offset_samples + segment_length].to(model_device)
+            frame, scale = model._encode_frame(segment_wav)
 
-        if scale is not None:
-            chunk_fo.write(struct.pack('!f', float(scale.cpu().item())))
-
-        _B, _K, T = frame.shape
-        if use_lm:
-            coder = ArithmeticCoder(chunk_fo)
-            states = None
-            offset = 0
-            input_ = torch.zeros(1, K, 1, dtype=torch.long, device=coder_device)
-        else:
-            packer = binary.BitPacker(model.bits_per_codebook, chunk_fo)
-
-        for t in range(T):
+        if not header_written:
+            _, K, _ = frame.shape
             if use_lm:
-                with torch.inference_mode():
-                    logits_raw, states, offset = lm.forward_logits(input_, states, offset)
-                    logits_q = _quantize_logits_(logits_raw / lm_tau, LOGIT_QSTEP)
-                    probas = _softmax_or_uniform(logits_q, dim=1)
+                lm = model.get_lm_model(device=lm_device,
+                                        dtype=DETERMINISTIC_LM_DTYPE).eval()
+                lm.tau = lm_tau
 
-                pdf_mat = probas[0, :, :, 0].to(coder_device)
-                cdf_mat = _deterministic_cdf_multi(
-                    pdf_mat, coder.total_range_bits,
-                    fp_scale=FP_SCALE, min_range=MIN_RANGE, check=False)
-                cdf_cols = cdf_mat.t().contiguous()
-
-                frame_slice = frame[:, :, t:t + 1].detach().to(coder_device)
-                for k, value in enumerate(frame_slice[0, :, 0].tolist()):
-                    coder.push(value, cdf_cols[k])
-                input_ = 1 + frame_slice
-            else:
-                for value in frame[0, :, t].detach().cpu().tolist():
-                    packer.push(value)
+            metadata = {
+                'm':   model.name,
+                'al':  audio_length,
+                'nc':  int(K),
+                'lm':  bool(use_lm),
+                'fp':  int(FP_SCALE),
+                'mr':  int(MIN_RANGE),
+                'acv': 4 if use_lm else 0,
+                'tau': float(lm_tau),
+            }
+            binary.write_ecdc_header(fo, metadata)
+            header_written = True
 
         if use_lm:
-            coder.flush()
+            chunk_fo = io.BytesIO()
+            _write_frame_payload(
+                frame,
+                scale,
+                chunk_fo,
+                use_lm=True,
+                model=model,
+                coder_device=coder_device,
+                lm_device=lm_device,
+                lm=lm,
+                lm_tau=lm_tau,
+            )
             _write_chunk(fo, chunk_fo.getvalue())
         else:
-            packer.flush()
-            fo.write(chunk_fo.getvalue())
+            _write_frame_payload(
+                frame,
+                scale,
+                fo,
+                use_lm=False,
+                model=model,
+                coder_device=coder_device,
+                lm_device=lm_device,
+                lm=None,
+                lm_tau=lm_tau,
+            )
+
+        _emit_progress(progress_callback, _build_progress_payload(
+            stage='segment',
+            sample_rate=int(model.sample_rate),
+            total_segments=total_segments,
+            segment_index=segment_index,
+            audio_length=audio_length,
+            segment_length=segment_length,
+            segment_stride=segment_stride,
+            offset_samples=int(offset_samples),
+        ))
 
 
 def decompress_from_file(fo: tp.IO[bytes],
@@ -521,10 +702,19 @@ def decompress_from_file(fo: tp.IO[bytes],
 
 
 def compress(model: EncodecModel, wav: torch.Tensor,
-             use_lm: bool = False) -> bytes:
+             use_lm: bool = False,
+             progress_callback: ProgressCallback = None,
+             lm_chunked: tp.Optional[bool] = None) -> bytes:
     """Compress a waveform and return bytes."""
     fo = io.BytesIO()
-    compress_to_file(model, wav, fo, use_lm=use_lm)
+    compress_to_file(
+        model,
+        wav,
+        fo,
+        use_lm=use_lm,
+        progress_callback=progress_callback,
+        lm_chunked=lm_chunked,
+    )
     return fo.getvalue()
 
 
