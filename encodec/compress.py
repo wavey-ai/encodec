@@ -6,12 +6,16 @@
 
 """API to compress/decompress audio to bytestreams."""
 
+import atexit
+import concurrent.futures
 import io
 import math
+import multiprocessing
 import os
 import struct
 import typing as tp
 import zlib
+from concurrent.futures.process import BrokenProcessPool
 
 import torch
 
@@ -81,11 +85,16 @@ USE_NEAR_UNIFORM     = _env_bool("ENCODEC_USE_NEAR_UNIFORM", False)
 DETERMINISTIC_LM_DTYPE = _env_dtype("ENCODEC_DETERMINISTIC_LM_DTYPE", torch.float32)
 LM_DEVICE_MODE       = _env_choice("ENCODEC_LM_DEVICE", "cpu", {"cpu", "model"})
 LM_CHUNKED_DEFAULT   = _env_bool("ENCODEC_LM_CHUNKED", True)
+SEGMENT_WORKERS_DEFAULT = _env_int("ENCODEC_SEGMENT_WORKERS", 1)
 
 _IDX_CACHE: tp.Dict[tp.Tuple[str, int, int], torch.Tensor] = {}
 _UNIFORM_CDF_CACHE: tp.Dict[tp.Tuple[str, int, int, int, int], torch.Tensor] = {}
 _CHUNK_HEADER = struct.Struct('!II')   # chunk_len (uint32 BE), crc32 (uint32 BE)
 ProgressCallback = tp.Optional[tp.Callable[[tp.Dict[str, tp.Any]], None]]
+_WORKER_MODEL_CACHE: tp.Dict[tp.Tuple[str, float], EncodecModel] = {}
+_WORKER_LM_CACHE: tp.Dict[tp.Tuple[str, float, str], tp.Any] = {}
+_PARALLEL_EXECUTOR: tp.Optional[concurrent.futures.ProcessPoolExecutor] = None
+_PARALLEL_EXECUTOR_WORKERS = 0
 
 
 # ---------------------------------------------------------------------------
@@ -303,6 +312,170 @@ def _build_progress_payload(
         payload['offsetSamples'] = int(offset_samples)
     return payload
 
+
+def _parallel_segment_worker_count(
+    total_segments: int,
+    *,
+    use_lm: bool,
+    lm_chunked: bool,
+    model_device: torch.device,
+) -> int:
+    configured = SEGMENT_WORKERS_DEFAULT
+    if configured <= 0:
+        configured = os.cpu_count() or 1
+    if (
+        configured <= 1
+        or total_segments <= 1
+        or not use_lm
+        or not lm_chunked
+        or model_device.type != 'cpu'
+        or LM_DEVICE_MODE != 'cpu'
+    ):
+        return 1
+    return max(1, min(int(configured), int(total_segments)))
+
+
+def _build_segment_batches(
+    wav: torch.Tensor,
+    offsets: tp.List[int],
+    segment_length: int,
+    worker_count: int,
+) -> tp.List[tp.List[tp.Tuple[int, int, torch.Tensor]]]:
+    batch_count = max(1, min(worker_count, len(offsets)))
+    batch_size = int(math.ceil(len(offsets) / batch_count))
+    batches: tp.List[tp.List[tp.Tuple[int, int, torch.Tensor]]] = []
+    for start in range(0, len(offsets), batch_size):
+        batch: tp.List[tp.Tuple[int, int, torch.Tensor]] = []
+        for absolute_index, offset_samples in enumerate(offsets[start:start + batch_size], start=start + 1):
+            segment = wav[:, offset_samples: offset_samples + segment_length].detach().cpu().contiguous()
+            batch.append((absolute_index, int(offset_samples), segment))
+        batches.append(batch)
+    return batches
+
+
+def _init_parallel_worker_runtime() -> None:
+    torch.use_deterministic_algorithms(True)
+    torch.backends.mkldnn.enabled = False
+    try:
+        torch.set_num_threads(1)
+    except RuntimeError:
+        pass
+
+
+def _shutdown_parallel_executor() -> None:
+    global _PARALLEL_EXECUTOR
+    global _PARALLEL_EXECUTOR_WORKERS
+    executor = _PARALLEL_EXECUTOR
+    _PARALLEL_EXECUTOR = None
+    _PARALLEL_EXECUTOR_WORKERS = 0
+    if executor is not None:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
+def _get_parallel_executor(worker_count: int) -> concurrent.futures.ProcessPoolExecutor:
+    global _PARALLEL_EXECUTOR
+    global _PARALLEL_EXECUTOR_WORKERS
+    if worker_count <= 1:
+        raise ValueError('worker_count must be greater than 1 for the parallel executor.')
+    if _PARALLEL_EXECUTOR is None or _PARALLEL_EXECUTOR_WORKERS != worker_count:
+        _shutdown_parallel_executor()
+        _PARALLEL_EXECUTOR = concurrent.futures.ProcessPoolExecutor(
+            max_workers=worker_count,
+            mp_context=multiprocessing.get_context('spawn'),
+            initializer=_init_parallel_worker_runtime,
+        )
+        _PARALLEL_EXECUTOR_WORKERS = worker_count
+    return _PARALLEL_EXECUTOR
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        pass
+
+
+def _get_parallel_worker_model(
+    model_name: str,
+    bandwidth: float,
+    *,
+    use_lm: bool,
+    lm_tau: float,
+) -> tp.Tuple[EncodecModel, tp.Optional[tp.Any]]:
+    model_key = (model_name, float(bandwidth))
+    model = _WORKER_MODEL_CACHE.get(model_key)
+    if model is None:
+        model = MODELS[model_name]().eval()
+        model.set_target_bandwidth(float(bandwidth))
+        model.to('cpu')
+        _WORKER_MODEL_CACHE[model_key] = model
+
+    lm = None
+    if use_lm:
+        lm_key = (model_name, float(bandwidth), str(DETERMINISTIC_LM_DTYPE))
+        lm = _WORKER_LM_CACHE.get(lm_key)
+        if lm is None:
+            lm = model.get_lm_model(
+                device=torch.device('cpu'),
+                dtype=DETERMINISTIC_LM_DTYPE,
+            ).eval()
+            _WORKER_LM_CACHE[lm_key] = lm
+        lm.tau = float(lm_tau)
+
+    return model, lm
+
+
+def _encode_segment_batch_worker(
+    model_name: str,
+    bandwidth: float,
+    use_lm: bool,
+    lm_tau: float,
+    batch: tp.List[tp.Tuple[int, int, torch.Tensor]],
+) -> dict:
+    _init_parallel_worker_runtime()
+    model, lm = _get_parallel_worker_model(
+        model_name,
+        bandwidth,
+        use_lm=use_lm,
+        lm_tau=lm_tau,
+    )
+    coder_device = torch.device('cpu')
+    lm_device = torch.device('cpu')
+    segments: tp.List[tp.Tuple[int, int, bytes]] = []
+    num_codebooks: tp.Optional[int] = None
+
+    for segment_index, offset_samples, segment in batch:
+        segment_wav = segment.unsqueeze(0)
+        with torch.inference_mode():
+            frame, scale = model._encode_frame(segment_wav.to(coder_device))
+        if num_codebooks is None:
+            num_codebooks = int(frame.shape[1])
+
+        payload_fo = io.BytesIO()
+        _write_frame_payload(
+            frame,
+            scale,
+            payload_fo,
+            use_lm=use_lm,
+            model=model,
+            coder_device=coder_device,
+            lm_device=lm_device,
+            lm=lm,
+            lm_tau=lm_tau,
+        )
+
+        framed_fo = io.BytesIO()
+        if use_lm:
+            _write_chunk(framed_fo, payload_fo.getvalue())
+        else:
+            framed_fo.write(payload_fo.getvalue())
+        segments.append((int(segment_index), int(offset_samples), framed_fo.getvalue()))
+
+    return {
+        'numCodebooks': int(num_codebooks or 0),
+        'segments': segments,
+    }
+
+
+atexit.register(_shutdown_parallel_executor)
+
 def _write_chunk(fo: tp.IO[bytes], payload: bytes) -> None:
     """Write a CRC-protected chunk: [len: u32][crc: u32][payload]."""
     fo.write(_CHUNK_HEADER.pack(len(payload), zlib.crc32(payload) & 0xffffffff))
@@ -473,6 +646,71 @@ def compress_to_file(model: EncodecModel, wav: torch.Tensor, fo: tp.IO[bytes],
                 segment_stride=segment_stride,
                 offset_samples=int(offset_samples),
             ))
+        return
+
+    parallel_workers = _parallel_segment_worker_count(
+        total_segments,
+        use_lm=use_lm,
+        lm_chunked=bool(lm_chunked),
+        model_device=model_device,
+    )
+
+    if parallel_workers > 1:
+        num_codebooks = int(model.quantizer.get_num_quantizers_for_bandwidth(
+            model.frame_rate,
+            model.bandwidth,
+        ))
+        metadata = {
+            'm':   model.name,
+            'al':  audio_length,
+            'nc':  num_codebooks,
+            'lm':  bool(use_lm),
+            'fp':  int(FP_SCALE),
+            'mr':  int(MIN_RANGE),
+            'acv': 4 if use_lm else 0,
+            'tau': float(lm_tau),
+        }
+        binary.write_ecdc_header(fo, metadata)
+
+        batches = _build_segment_batches(wav, offsets, segment_length, parallel_workers)
+        completed_segments = 0
+        ordered_results: tp.List[dict] = []
+        executor = _get_parallel_executor(parallel_workers)
+        try:
+            futures = [
+                executor.submit(
+                    _encode_segment_batch_worker,
+                    model.name,
+                    float(model.bandwidth or 0.0),
+                    bool(use_lm),
+                    float(lm_tau),
+                    batch,
+                )
+                for batch in batches
+            ]
+
+            for future in concurrent.futures.as_completed(futures):
+                result = future.result()
+                ordered_results.append(result)
+                completed_segments += len(result['segments'])
+                last_index, last_offset, _ = result['segments'][-1]
+                _emit_progress(progress_callback, _build_progress_payload(
+                    stage='segment',
+                    sample_rate=int(model.sample_rate),
+                    total_segments=total_segments,
+                    segment_index=min(completed_segments, total_segments),
+                    audio_length=audio_length,
+                    segment_length=segment_length,
+                    segment_stride=segment_stride,
+                    offset_samples=int(last_offset),
+                ))
+        except BrokenProcessPool:
+            _shutdown_parallel_executor()
+            raise
+
+        for result in sorted(ordered_results, key=lambda item: item['segments'][0][0]):
+            for _, _, framed_payload in result['segments']:
+                fo.write(framed_payload)
         return
 
     header_written = False
