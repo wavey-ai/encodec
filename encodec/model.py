@@ -204,14 +204,15 @@ class EncodecModel(nn.Module):
 
     def get_lm_model(self,
                      device: tp.Optional[torch.device] = None,
-                     dtype: torch.dtype = torch.float32) -> LMModel:
+                     dtype: torch.dtype = torch.float64) -> LMModel:
         """Load the pre-trained language model for entropy coding.
 
         Args:
             device: target device (defaults to CPU — LM must stay on CPU for
                     cross-platform arithmetic-coder determinism).
-            dtype: LM weight dtype.  float32 is faster and sufficient when
-                   combined with the deterministic logit-quantisation path.
+            dtype: LM weight dtype.  float64 is the safer default for
+                   cross-host determinism; float32 can be selected when
+                   speed matters more than exact portability.
         """
         device = torch.device("cpu") if device is None else device
         lm = LMModel(self.quantizer.n_q, self.quantizer.bins, num_layers=5, dim=200,

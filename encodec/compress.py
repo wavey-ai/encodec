@@ -76,13 +76,14 @@ def _env_choice(name: str, default: str, choices: tp.Set[str]) -> str:
         raise ValueError(f"Unsupported value {v!r} for {name}. Expected one of: {allowed}.")
     return value
 
-# Lean defaults: float32 LM, finer logit grid, high-precision CDF allocation.
-LOGIT_QSTEP          = _env_float("ENCODEC_LOGIT_QSTEP", 1.0 / 128.0)
+# Conservative defaults: float64 LM, slightly coarser logit quantisation,
+# and wider CDF bins for better cross-host determinism.
+LOGIT_QSTEP          = _env_float("ENCODEC_LOGIT_QSTEP", 1.0 / 64.0)
 LM_TAU               = _env_float("ENCODEC_LM_TAU", 1.0)
-FP_SCALE             = _env_int("ENCODEC_AC_FP_SCALE", 1 << 16)
-MIN_RANGE            = _env_int("ENCODEC_AC_MIN_RANGE", 1)
+FP_SCALE             = _env_int("ENCODEC_AC_FP_SCALE", 1 << 13)
+MIN_RANGE            = _env_int("ENCODEC_AC_MIN_RANGE", 2)
 USE_NEAR_UNIFORM     = _env_bool("ENCODEC_USE_NEAR_UNIFORM", False)
-DETERMINISTIC_LM_DTYPE = _env_dtype("ENCODEC_DETERMINISTIC_LM_DTYPE", torch.float32)
+DETERMINISTIC_LM_DTYPE = _env_dtype("ENCODEC_DETERMINISTIC_LM_DTYPE", torch.float64)
 LM_DEVICE_MODE       = _env_choice("ENCODEC_LM_DEVICE", "cpu", {"cpu", "model"})
 LM_CHUNKED_DEFAULT   = _env_bool("ENCODEC_LM_CHUNKED", True)
 SEGMENT_WORKERS_DEFAULT = _env_int("ENCODEC_SEGMENT_WORKERS", 1)
@@ -356,10 +357,6 @@ def _build_segment_batches(
 def _init_parallel_worker_runtime() -> None:
     torch.use_deterministic_algorithms(True)
     torch.backends.mkldnn.enabled = False
-    try:
-        torch.set_num_threads(1)
-    except RuntimeError:
-        pass
 
 
 def _shutdown_parallel_executor() -> None:

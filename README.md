@@ -111,10 +111,10 @@ All settings are overridable via environment variables:
 | Variable | Default | Notes |
 |---|---|---|
 | `ENCODEC_LM_TAU` | `1.0` | Softmax temperature. `1.0` is optimal for compression. |
-| `ENCODEC_LOGIT_QSTEP` | `1/128` | Logit quantisation grid size. |
-| `ENCODEC_AC_FP_SCALE` | `65536` | Integer scale for CDF allocation (`2^16`). |
-| `ENCODEC_AC_MIN_RANGE` | `1` | Minimum CDF range per symbol. |
-| `ENCODEC_DETERMINISTIC_LM_DTYPE` | `float32` | LM weight dtype. `float32` is faster; `float64` available. |
+| `ENCODEC_LOGIT_QSTEP` | `1/64` | Logit quantisation grid size. Slightly coarser is safer cross-host. |
+| `ENCODEC_AC_FP_SCALE` | `8192` | Integer scale for CDF allocation (`2^13`). |
+| `ENCODEC_AC_MIN_RANGE` | `2` | Minimum CDF range per symbol. Wider bins improve portability. |
+| `ENCODEC_DETERMINISTIC_LM_DTYPE` | `float64` | LM weight dtype. `float64` is safer for cross-host determinism; `float32` is faster. |
 | `ENCODEC_USE_NEAR_UNIFORM` | `0` | Enable near-uniform prior (off by default). |
 
 ### Compression results
