@@ -8,6 +8,8 @@ This is the code for the EnCodec neural codec presented in [High Fidelity Neural
 - A causal model operating at **24 kHz** on monophonic audio trained on a variety of audio data.
 - A non-causal model operating at **48 kHz** on stereophonic audio trained on music-only data.
 
+Bottom line for the `wavey-ai` fork: on an RTX 4000 Ada, the deterministic LM path cut 48 kHz GPU encode from `99s` to `13s` on a full song, made `cuda -> cpu` decode work reliably, and slightly improved GPU decode. The trade-off is that CPU-only decode is slower than upstream.
+
 The 24 kHz model supports 1.5, 3, 6, 12, and 24 kbps. The 48 kHz model supports 3, 6, 12, and 24 kbps. A pre-trained language model is available for each, enabling entropy coding that reduces bitstream size by up to 40% without further quality loss.
 
 <p align="center">
@@ -44,7 +46,7 @@ audio_codes = model(inputs["input_values"], inputs["padding_mask"]).audio_codes
 
 ## Precision and Robustness Improvements (wavey-ai fork)
 
-This fork extends the original EnCodec with a fully deterministic, cross-platform entropy coding path. The changes affect `encodec/compress.py` and `encodec/model.py` only — the neural network weights and audio quality are unchanged.
+This fork extends the original EnCodec with a fully deterministic, cross-platform entropy coding path plus optional native entropy-coder acceleration. The neural network weights remain unchanged.
 
 ### Bitstream version `acv=4`
 
@@ -60,7 +62,7 @@ A single corrupt byte damages at most one chunk. The decoder substitutes silence
 
 The original LM entropy path was not deterministic across hardware (MPS, CUDA, CPU), causing cross-device decode failures. The deterministic path fixes this by:
 
-- Running the arithmetic coder and LM **always on CPU**, regardless of model device.
+- Running the arithmetic coder on CPU and keeping the encode-side LM on CPU by default. On CUDA decode, `ENCODEC_DECODE_LM_DEVICE=auto` can run the deterministic decode LM on the model device while preserving payload compatibility.
 - Computing softmax in **float64** via a sequential cumsum denominator (`_stable_softmax`) rather than platform-native `torch.softmax`, which can differ by a ULP across devices.
 - **Quantising logits** to a 1/128 grid before softmax. Small floating-point differences that do not change the quantised logit produce identical CDFs.
 - Building the CDF from **integer floor counts** (`FP_SCALE = 65536`) with deterministic priority allocation for the residual.
@@ -74,6 +76,25 @@ Cross-device decode matrix (payloads encoded on Apple Silicon Mac):
 | Mac CPU | Linux CUDA | EOFError | ✓ |
 | Mac MPS | Linux CPU | EOFError | ✓ |
 | Mac MPS | Linux CUDA | EOFError | ✓ |
+
+### RTX 4000 Ada results
+
+Benchmarked on April 3, 2026 on a Linode `g2-gpu-rtx4000a1-s` instance (1x RTX 4000 Ada, 4 vCPU, Ubuntu 24.04) using `02 - Lori Asha - Westside` from the Lori Asha album premix, resampled to 48 kHz stereo, with `encodec_48khz`, `6 kbps`, and `use_lm=True`.
+
+| Repo / case | Encode | Encode x realtime | Decode | Decode x realtime | Result |
+|---|---:|---:|---:|---:|---|
+| Upstream `cuda -> cuda` | `99.07 s` | `2.10x` | `116.56 s` | `1.79x` | baseline |
+| Upstream `cuda -> cpu` | `98.73 s` | `2.11x` | fail | — | `RuntimeError('Binary search failed')` |
+| Upstream `cpu -> cpu` | `103.81 s` | `2.01x` | `108.91 s` | `1.91x` | baseline |
+| Fork `cuda -> cuda` | `13.09 s` | `15.93x` | `109.49 s` | `1.90x` | encode `7.57x` faster than upstream GPU, decode `1.06x` faster |
+| Fork `cuda -> cpu` | `12.94 s` | `16.11x` | `167.56 s` | `1.24x` | cross-architecture decode succeeds |
+| Fork `cpu -> cpu` | `35.22 s` | `5.92x` | `160.96 s` | `1.30x` | encode `2.95x` faster than upstream CPU, CPU decode slower |
+
+What this means in practice:
+
+- The biggest RTX win is encode throughput. On this full-length track, the fork cut GPU encode time from `99.07 s` to `13.09 s`.
+- GPU decode is modestly faster than upstream on the same Ada card, but the main portability win is that `cuda -> cpu` decode works at all.
+- CPU-only decode remains a trade-off: the deterministic cross-architecture path is slower than upstream's CPU decode, but it preserves compatibility across CPU, CUDA, and Apple Silicon payload handoffs.
 
 ### Critical bug fix: `_counts_from_pdf`
 
@@ -128,7 +149,7 @@ Benchmarked on 7 stereo 48 kHz music tracks (10 s clips), `encodec_48khz`:
 | 24 kbps | CPU | 19.3 | 19.9% | 0.39× | 0.41× |
 | 24 kbps | MPS | 19.3 | 19.9% | 0.47× | 0.40× |
 
-RTF < 1.0 means faster than real time. The LM runs on CPU in all cases; MPS accelerates model encode/decode but does not reduce LM inference time.
+RTF < 1.0 means faster than real time. On Apple Silicon the LM still runs on CPU by default, so MPS primarily accelerates model encode/decode. On CUDA decode, `ENCODEC_DECODE_LM_DEVICE=auto` can move deterministic LM decode to the GPU, which is what the Ada benchmark above measures.
 
 ### Chunk size tradeoffs
 
