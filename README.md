@@ -10,7 +10,7 @@
 
 ## wavey-ai fork README
 
-Bottom line for the `wavey-ai` fork: on an RTX 4000 Ada, the deterministic LM path cut 48 kHz GPU encode from `99s` to `13s` on a full song, made `cuda -> cpu` decode work reliably, and slightly improved GPU decode. The trade-off is that CPU-only decode is slower than upstream.
+Bottom line for the `wavey-ai` fork: on an RTX 4000 Ada, the deterministic LM path cut 48 kHz GPU encode from `99s` to `13s` on a full song, made `cuda -> cpu` decode work reliably, and slightly improved GPU decode. The trade-off is that CPU-only decode was about `48%` slower than upstream on the tested full-song run (`160.96s` vs `108.91s`).
 
 ### Precision and Robustness Improvements
 
@@ -62,7 +62,7 @@ What this means in practice:
 
 - The biggest RTX win is encode throughput. On this full-length track, the fork cut GPU encode time from `99.07 s` to `13.09 s`.
 - GPU decode is modestly faster than upstream on the same Ada card, but the main portability win is that `cuda -> cpu` decode works at all.
-- CPU-only decode remains a trade-off: the deterministic cross-architecture path is slower than upstream's CPU decode, but it preserves compatibility across CPU, CUDA, and Apple Silicon payload handoffs.
+- CPU-only decode remains a trade-off: on the tested full-song run it was about `48%` slower than upstream (`160.96s` vs `108.91s`), but it preserves compatibility across CPU, CUDA, and Apple Silicon payload handoffs.
 
 ### Critical bug fix: `_counts_from_pdf`
 
