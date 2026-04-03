@@ -1096,7 +1096,11 @@ def decompress_from_file(fo: tp.IO[bytes],
             else:
                 decoder = ArithmeticDecoder(frame_fo, total_range_bits=ARITHMETIC_TOTAL_RANGE_BITS)
             states = None
-            offset = 0
+            offset: tp.Union[int, torch.Tensor]
+            if acv >= 3 and lm_device.type != "cpu":
+                offset = torch.zeros((), dtype=torch.long, device=lm_device)
+            else:
+                offset = 0
             input_ = torch.zeros(1, num_codebooks, 1, dtype=torch.long,
                                  device=lm_device if acv >= 3 else coder_device)
         else:

@@ -48,10 +48,61 @@ class LMModel(nn.Module):
         self.linears = nn.ModuleList([nn.Linear(dim, card, dtype=dtype) for _ in range(n_q)])
         self.logit_step = 1.0 / 64.0
         self.tau = tau
+        self._stacked_cache_key: tp.Optional[tp.Tuple[tp.Tuple[int, ...], tp.Tuple[int, ...]]] = None
+        self._stacked_emb_weight: tp.Optional[torch.Tensor] = None
+        self._stacked_linear_weight: tp.Optional[torch.Tensor] = None
+        self._stacked_linear_bias: tp.Optional[torch.Tensor] = None
+        self._stacked_k_index: tp.Optional[torch.Tensor] = None
+
+    def _get_stacked_inference_params(self) -> tp.Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        cache_key = (
+            tuple(emb.weight.data_ptr() for emb in self.emb),
+            tuple(linear.weight.data_ptr() for linear in self.linears),
+        )
+        if cache_key != self._stacked_cache_key:
+            self._stacked_emb_weight = torch.stack(
+                [emb.weight.detach() for emb in self.emb],
+                dim=0,
+            ).contiguous()
+            self._stacked_linear_weight = torch.stack(
+                [linear.weight.detach() for linear in self.linears],
+                dim=0,
+            ).contiguous()
+            self._stacked_linear_bias = torch.stack(
+                [linear.bias.detach() for linear in self.linears],
+                dim=0,
+            ).contiguous()
+            self._stacked_k_index = torch.arange(
+                self.n_q,
+                device=self._stacked_emb_weight.device,
+            ).view(self.n_q, 1, 1)
+            self._stacked_cache_key = cache_key
+        assert self._stacked_emb_weight is not None
+        assert self._stacked_linear_weight is not None
+        assert self._stacked_linear_bias is not None
+        assert self._stacked_k_index is not None
+        return (
+            self._stacked_emb_weight,
+            self._stacked_linear_weight,
+            self._stacked_linear_bias,
+            self._stacked_k_index,
+        )
 
     def forward_logits(self, indices: torch.Tensor,
                        states: tp.Optional[tp.List[torch.Tensor]] = None, offset: int = 0):
         B, K, T = indices.shape
+        if not self.training and not torch.is_grad_enabled():
+            emb_weight, linear_weight, linear_bias, k_index = self._get_stacked_inference_params()
+            emb_weight = emb_weight[:K]
+            linear_weight = linear_weight[:K]
+            linear_bias = linear_bias[:K]
+            picked = emb_weight[k_index[:K], indices.permute(1, 0, 2)]
+            input_ = picked.sum(dim=0)
+            out, states, offset = self.transformer(input_, states, offset)
+            logits = torch.einsum('btd,kod->bkto', out, linear_weight)
+            logits = logits + linear_bias.view(1, K, 1, self.card)
+            return logits.permute(0, 3, 1, 2), states, offset
+
         input_ = sum([self.emb[k](indices[:, k]) for k in range(K)])
         out, states, offset = self.transformer(input_, states, offset)
         logits = torch.stack([self.linears[k](out) for k in range(K)], dim=1).permute(0, 3, 1, 2)
