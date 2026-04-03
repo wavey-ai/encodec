@@ -98,6 +98,7 @@ LM_DEVICE_MODE       = _env_choice("ENCODEC_LM_DEVICE", "cpu", {"cpu", "model"})
 DECODE_LM_DEVICE_MODE = _env_choice("ENCODEC_DECODE_LM_DEVICE", "auto", {"auto", "cpu", "model"})
 LM_CHUNKED_DEFAULT   = _env_bool("ENCODEC_LM_CHUNKED", True)
 SEGMENT_WORKERS_DEFAULT = _env_int("ENCODEC_SEGMENT_WORKERS", 1)
+DECODE_SEGMENT_WORKERS_DEFAULT = _env_int("ENCODEC_DECODE_SEGMENT_WORKERS", 0)
 NATIVE_AC_ENABLED    = _env_bool("ENCODEC_NATIVE_AC", True)
 TORCH_EXT_AC_ENABLED = _env_bool("ENCODEC_TORCH_EXT", False)
 ARITHMETIC_TOTAL_RANGE_BITS = 24
@@ -443,6 +444,26 @@ def _parallel_segment_worker_count(
     return max(1, min(int(configured), int(total_segments)))
 
 
+def _parallel_decode_segment_worker_count(
+    total_segments: int,
+    *,
+    model_device: torch.device,
+    acv: int,
+) -> int:
+    configured = DECODE_SEGMENT_WORKERS_DEFAULT
+    available_cpus = os.cpu_count() or 1
+    if configured <= 0:
+        configured = max(1, int(available_cpus) - 1)
+    if (
+        configured <= 1
+        or total_segments <= 1
+        or acv != 4
+        or model_device.type != 'cpu'
+    ):
+        return 1
+    return max(1, min(int(configured), int(total_segments), int(available_cpus)))
+
+
 def _build_segment_batches(
     wav: torch.Tensor,
     offsets: tp.List[int],
@@ -461,9 +482,29 @@ def _build_segment_batches(
     return batches
 
 
+def _build_decode_segment_batches(
+    segments: tp.List[tp.Tuple[int, int, int, bytes]],
+    worker_count: int,
+) -> tp.List[tp.List[tp.Tuple[int, int, int, bytes]]]:
+    batch_count = max(1, min(worker_count, len(segments)))
+    batch_size = int(math.ceil(len(segments) / batch_count))
+    batches: tp.List[tp.List[tp.Tuple[int, int, int, bytes]]] = []
+    for start in range(0, len(segments), batch_size):
+        batches.append(segments[start:start + batch_size])
+    return batches
+
+
 def _init_parallel_worker_runtime() -> None:
     torch.use_deterministic_algorithms(True)
     torch.backends.mkldnn.enabled = False
+    try:
+        torch.set_num_threads(1)
+    except RuntimeError:
+        pass
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        pass
 
 
 def _shutdown_parallel_executor() -> None:
@@ -490,10 +531,6 @@ def _get_parallel_executor(worker_count: int) -> concurrent.futures.ProcessPoolE
         )
         _PARALLEL_EXECUTOR_WORKERS = worker_count
     return _PARALLEL_EXECUTOR
-    try:
-        torch.set_num_interop_threads(1)
-    except RuntimeError:
-        pass
 
 
 def _get_parallel_worker_model(
@@ -646,6 +683,165 @@ def _encode_segment_batch_worker(
 
     return {
         'numCodebooks': int(num_codebooks or 0),
+        'segments': segments,
+    }
+
+
+def _decode_acv4_chunk_payload(
+    payload: bytes,
+    *,
+    model: EncodecModel,
+    model_device: torch.device,
+    coder_device: torch.device,
+    lm_device: torch.device,
+    num_codebooks: int,
+    use_lm: bool,
+    fp_scale: int,
+    min_range: int,
+    lm_tau: float,
+    lm: tp.Optional[tp.Any],
+    legacy_lm: tp.Optional[tp.Any],
+    this_len: int,
+) -> torch.Tensor:
+    frame_fo = io.BytesIO(payload)
+
+    if model.normalize:
+        scale_f, = struct.unpack('!f', binary._read_exactly(
+            frame_fo, struct.calcsize('!f')))
+        scale = torch.tensor(scale_f, device=coder_device).view(1)
+    else:
+        scale = None
+
+    if use_lm:
+        native_decoder = None
+        code_buf = None
+        decoder = None
+        native_module = _tensor_native_ac_module()
+        if native_module is not None:
+            native_decoder = native_module.ArithmeticDecoder(
+                frame_fo.read(),
+                ARITHMETIC_TOTAL_RANGE_BITS,
+            )
+            code_buf = torch.empty(num_codebooks, dtype=torch.long, device=coder_device)
+        else:
+            decoder = ArithmeticDecoder(frame_fo, total_range_bits=ARITHMETIC_TOTAL_RANGE_BITS)
+        states = None
+        offset: tp.Union[int, torch.Tensor]
+        if lm_device.type != "cpu":
+            offset = torch.zeros((), dtype=torch.long, device=lm_device)
+        else:
+            offset = 0
+        input_ = torch.zeros(1, num_codebooks, 1, dtype=torch.long, device=lm_device)
+    else:
+        unpacker = binary.BitUnpacker(model.bits_per_codebook, frame_fo)
+
+    frame_length = int(math.ceil(this_len * model.frame_rate / model.sample_rate))
+    frame = torch.zeros(1, num_codebooks, frame_length, dtype=torch.long, device=coder_device)
+    try:
+        with torch.inference_mode():
+            for t in range(frame_length):
+                if use_lm:
+                    assert lm is not None
+                    logits_raw, states, offset = lm.forward_logits(input_, states, offset)
+                    logits_q = _quantize_logits_(logits_raw / lm_tau, LOGIT_QSTEP)
+                    probas = _softmax_or_uniform(logits_q, dim=1)
+                    pdf_mat = probas[0, :, :, 0].to(coder_device)
+                    if native_decoder is not None:
+                        assert code_buf is not None
+                        native_decoder.pull_symbols_into_torch(
+                            pdf_mat.detach().contiguous(),
+                            code_buf,
+                            fp_scale,
+                            min_range,
+                        )
+                        frame[0, :, t] = code_buf
+                        input_ = 1 + code_buf.view(1, num_codebooks, 1).to(lm_device)
+                    else:
+                        assert decoder is not None
+                        cdf_mat = _deterministic_cdf_multi(
+                            pdf_mat,
+                            decoder.total_range_bits,
+                            fp_scale=fp_scale,
+                            min_range=min_range,
+                            check=False,
+                        )
+                        cdf_cols = cdf_mat.t().contiguous()
+                        code_list = []
+                        for k in range(num_codebooks):
+                            code = decoder.pull(cdf_cols[k])
+                            if code is None:
+                                raise EOFError("Stream ended before expected.")
+                            code_list.append(code)
+                        frame[0, :, t] = torch.tensor(code_list, dtype=torch.long, device=coder_device)
+                        input_ = (1 + frame[:, :, t:t + 1]).to(lm_device)
+                elif legacy_lm is not None:
+                    assert False, "legacy LM is not expected for acv4 chunk decode"
+                else:
+                    code_list = []
+                    for _ in range(num_codebooks):
+                        code = unpacker.pull()
+                        if code is None:
+                            raise EOFError("Stream ended before expected.")
+                        code_list.append(code)
+                    frame[0, :, t] = torch.tensor(code_list, dtype=torch.long, device=coder_device)
+    except Exception:
+        return torch.zeros(1, model.channels, this_len, device=model_device)
+
+    encoded_frame = (
+        frame.to(model_device),
+        None if scale is None else scale.to(model_device),
+    )
+    with torch.inference_mode():
+        return model._decode_frame(encoded_frame)[..., :this_len]
+
+
+def _decode_segment_batch_worker(
+    model_name: str,
+    num_codebooks: int,
+    use_lm: bool,
+    lm_tau: float,
+    fp_scale: int,
+    min_range: int,
+    batch: tp.List[tp.Tuple[int, int, int, bytes]],
+) -> dict:
+    _init_parallel_worker_runtime()
+    model = _get_decode_model(model_name, 'cpu')
+    model_device = torch.device('cpu')
+    coder_device = torch.device('cpu')
+    lm_device = _select_decode_lm_device(
+        model_device=model_device,
+        coder_device=coder_device,
+        acv=4,
+    )
+    lm, legacy_lm = _get_decode_lms(
+        model,
+        model_name=model_name,
+        coder_device=coder_device,
+        lm_device=lm_device,
+        use_lm=use_lm,
+        acv=4,
+        lm_tau=lm_tau,
+    )
+
+    segments: tp.List[tp.Tuple[int, int, torch.Tensor]] = []
+    for segment_index, offset_samples, this_len, payload in batch:
+        decoded = _decode_acv4_chunk_payload(
+            payload,
+            model=model,
+            model_device=model_device,
+            coder_device=coder_device,
+            lm_device=lm_device,
+            num_codebooks=num_codebooks,
+            use_lm=use_lm,
+            fp_scale=fp_scale,
+            min_range=min_range,
+            lm_tau=lm_tau,
+            lm=lm,
+            legacy_lm=legacy_lm,
+            this_len=this_len,
+        ).cpu()
+        segments.append((int(segment_index), int(offset_samples), decoded))
+    return {
         'segments': segments,
     }
 
@@ -1058,22 +1254,97 @@ def decompress_from_file(fo: tp.IO[bytes],
 
     segment_length = model.segment_length or audio_length
     segment_stride = model.segment_stride or audio_length
+    offsets = list(range(0, audio_length, segment_stride))
     decoded_frames: tp.List[torch.Tensor] = []
     frames: tp.List[EncodedFrame] = []
 
-    for offset_samples in range(0, audio_length, segment_stride):
+    parallel_decode_workers = _parallel_decode_segment_worker_count(
+        len(offsets),
+        model_device=model_device,
+        acv=acv,
+    )
+    if parallel_decode_workers > 1:
+        decoded_frames = [torch.zeros(0)] * len(offsets)
+        decodable_segments: tp.List[tp.Tuple[int, int, int, bytes]] = []
+        for segment_index, offset_samples in enumerate(offsets, start=1):
+            this_len = min(audio_length - offset_samples, segment_length)
+            try:
+                payload = _read_chunk_payload(fo)
+            except Exception:
+                decoded_frames[segment_index - 1] = torch.zeros(
+                    1,
+                    model.channels,
+                    this_len,
+                    device=model_device,
+                )
+                continue
+            decodable_segments.append((segment_index, int(offset_samples), this_len, payload))
+
+        if decodable_segments:
+            batches = _build_decode_segment_batches(decodable_segments, parallel_decode_workers)
+            ordered_results: tp.List[dict] = []
+            executor = _get_parallel_executor(parallel_decode_workers)
+            try:
+                futures = [
+                    executor.submit(
+                        _decode_segment_batch_worker,
+                        model_name,
+                        num_codebooks,
+                        bool(use_lm),
+                        float(lm_tau),
+                        int(fp_scale),
+                        int(min_range),
+                        batch,
+                    )
+                    for batch in batches
+                ]
+                for future in concurrent.futures.as_completed(futures):
+                    ordered_results.append(future.result())
+            except BrokenProcessPool:
+                _shutdown_parallel_executor()
+                raise
+
+            for result in sorted(ordered_results, key=lambda item: item['segments'][0][0]):
+                for segment_index, _offset_samples, decoded in result['segments']:
+                    decoded_frames[segment_index - 1] = decoded.to(model_device)
+
+        if model.segment_length is None:
+            wav = decoded_frames[0]
+        else:
+            wav = _linear_overlap_add(decoded_frames, model.segment_stride or 1)
+        return wav[0, :, :audio_length], model.sample_rate
+
+    for offset_samples in offsets:
         this_len = min(audio_length - offset_samples, segment_length)
         frame_length = int(math.ceil(this_len * model.frame_rate / model.sample_rate))
         frame_fo = fo
 
         if acv == 4:
             try:
-                frame_fo = io.BytesIO(_read_chunk_payload(fo))
+                payload = _read_chunk_payload(fo)
             except Exception:
                 # Corrupt chunk → substitute silence and continue.
                 decoded_frames.append(
                     torch.zeros(1, model.channels, this_len, device=model_device))
                 continue
+            decoded_frames.append(
+                _decode_acv4_chunk_payload(
+                    payload,
+                    model=model,
+                    model_device=model_device,
+                    coder_device=coder_device,
+                    lm_device=lm_device,
+                    num_codebooks=num_codebooks,
+                    use_lm=use_lm,
+                    fp_scale=fp_scale,
+                    min_range=min_range,
+                    lm_tau=lm_tau,
+                    lm=lm,
+                    legacy_lm=legacy_lm,
+                    this_len=this_len,
+                )
+            )
+            continue
 
         if model.normalize:
             scale_f, = struct.unpack('!f', binary._read_exactly(
@@ -1086,7 +1357,7 @@ def decompress_from_file(fo: tp.IO[bytes],
             native_decoder = None
             code_buf = None
             decoder = None
-            native_module = _tensor_native_ac_module() if acv == 4 else None
+            native_module = None
             if native_module is not None:
                 native_decoder = native_module.ArithmeticDecoder(
                     frame_fo.read(),
@@ -1112,6 +1383,7 @@ def decompress_from_file(fo: tp.IO[bytes],
             with torch.inference_mode():
                 for t in range(frame_length):
                     if use_lm and acv >= 3:
+                        assert lm is not None
                         logits_raw, states, offset = lm.forward_logits(
                             input_, states, offset)
                         logits_q = _quantize_logits_(logits_raw / lm_tau,
@@ -1173,20 +1445,11 @@ def decompress_from_file(fo: tp.IO[bytes],
                                                       device=coder_device)
 
         except Exception:
-            if acv == 4:
-                decoded_frames.append(
-                    torch.zeros(1, model.channels, this_len, device=model_device))
-                continue
             raise
 
         encoded_frame = (frame.to(model_device),
                          None if scale is None else scale.to(model_device))
-        if acv == 4:
-            with torch.inference_mode():
-                decoded_frames.append(
-                    model._decode_frame(encoded_frame)[..., :this_len])
-        else:
-            frames.append(encoded_frame)
+        frames.append(encoded_frame)
 
     if acv == 4:
         if model.segment_length is None:

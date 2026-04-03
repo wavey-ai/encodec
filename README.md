@@ -10,7 +10,7 @@
 
 ## wavey-ai fork README
 
-Bottom line for the `wavey-ai` fork: on an RTX 4000 Ada, the deterministic LM path cut 48 kHz GPU encode from `99s` to `13s` on a full song, made `cuda -> cpu` decode work reliably, and slightly improved GPU decode. The trade-off is that CPU-only decode was about `48%` slower than upstream on the tested full-song run (`160.96s` vs `108.91s`).
+Bottom line for the `wavey-ai` fork: on an RTX 4000 Ada, the deterministic LM path cut 48 kHz GPU encode from `99s` to `13s` on a full song, made `cuda -> cpu` decode work reliably, slightly improved GPU decode, and now defaults CPU chunk decode workers to `available CPUs - 1`. On the tested 4-vCPU Linode box, that auto default picked `3` workers and cut full-song CPU decode from `170.18s` to `92.52s` (`1.84x` faster). Forcing `4` workers reached `82.33s` (`2.07x` faster), but the worker topology is deterministic-with-itself rather than hash-identical to the previous threaded single-process CPU path.
 
 ### Precision and Robustness Improvements
 
@@ -63,6 +63,7 @@ What this means in practice:
 - The biggest RTX win is encode throughput. On this full-length track, the fork cut GPU encode time from `99.07 s` to `13.09 s`.
 - GPU decode is modestly faster than upstream on the same Ada card, but the main portability win is that `cuda -> cpu` decode works at all.
 - CPU-only decode remains a trade-off: on the tested full-song run it was about `48%` slower than upstream (`160.96s` vs `108.91s`), but it preserves compatibility across CPU, CUDA, and Apple Silicon payload handoffs.
+- CPU chunk decode now defaults to `available CPUs - 1` segment workers. On the same 4-vCPU Linode host, that default picked `3` workers and reduced the full-song CPU decode wall clock from `170.18s` to `92.52s`; forcing `4` workers reached `82.33s`. Set `ENCODEC_DECODE_SEGMENT_WORKERS=1` to restore the old single-process CPU decode topology.
 
 ### Critical bug fix: `_counts_from_pdf`
 
@@ -105,6 +106,7 @@ All settings are overridable via environment variables:
 | `ENCODEC_AC_MIN_RANGE` | `2` | Minimum CDF range per symbol. Wider bins improve portability. |
 | `ENCODEC_DETERMINISTIC_LM_DTYPE` | `float64` | LM weight dtype. `float64` is safer for cross-host determinism; `float32` is faster. |
 | `ENCODEC_USE_NEAR_UNIFORM` | `0` | Enable near-uniform prior (off by default). |
+| `ENCODEC_DECODE_SEGMENT_WORKERS` | `0` | Auto CPU `acv=4` decode workers: `available CPUs - 1`, clamped to at least `1`. Set `1` for the old single-process CPU path. |
 
 ### Compression results
 
@@ -127,6 +129,7 @@ The repo remains backward-compatible by default:
 - If the Torch C++ extension is not available, nothing breaks; it is off by default.
 - Legacy payloads (`acv < 3`) still decode through the legacy path.
 - Deterministic chunked payloads (`acv=4`) keep cross-device decode compatibility.
+- CPU `acv=4` decode now defaults to `available CPUs - 1` segment workers for throughput. Use `ENCODEC_DECODE_SEGMENT_WORKERS=1` if you need the older single-process CPU decode topology.
 
 Local fallback setup, no extra toolchain required:
 
@@ -161,6 +164,7 @@ Useful runtime knobs:
 | `ENCODEC_NATIVE_AC` | `1` | Use the Rust arithmetic/CDF path when `encodec_native` is installed. |
 | `ENCODEC_TORCH_EXT` | `0` | Enable the optional Torch C++ extension. |
 | `ENCODEC_DECODE_LM_DEVICE` | `auto` | On CUDA decode, prefer GPU LM decode while preserving payload compatibility. |
+| `ENCODEC_DECODE_SEGMENT_WORKERS` | `0` | CPU `acv=4` segment decode workers. `0` means `available CPUs - 1`; `1` restores the old single-process behavior. |
 
 ### Chunk size tradeoffs
 
