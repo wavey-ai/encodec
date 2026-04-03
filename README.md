@@ -10,11 +10,15 @@
 
 ## wavey-ai fork README
 
-Bottom line for the `wavey-ai` fork: on an RTX 4000 Ada, the deterministic LM path cut 48 kHz GPU encode from `99s` to `13s` on a full song, made `cuda -> cpu` decode work reliably, slightly improved GPU decode, and now defaults CPU chunk decode workers to `available CPUs - 1`. On the tested 4-vCPU Linode box, that auto default picked `3` workers and cut full-song CPU decode from `170.18s` to `92.52s` (`1.84x` faster). Forcing `4` workers reached `82.33s` (`2.07x` faster), but the worker topology is deterministic-with-itself rather than hash-identical to the previous threaded single-process CPU path.
+This fork keeps the upstream model weights and changes the codec/runtime behavior around them. The main additions are:
 
-### Precision and Robustness Improvements
+- a deterministic `acv=4` entropy path for cross-device payload compatibility
+- optional native entropy-coder acceleration
+- chunked CPU decode parallelism for `acv=4` payloads
 
-This fork extends the original EnCodec with a fully deterministic, cross-platform entropy coding path plus optional native entropy-coder acceleration. The neural network weights remain unchanged.
+On the RTX 4000 Ada benchmark in this README, the fork improved 48 kHz GPU encode from `99.07 s` to `13.09 s`, preserved `cuda -> cpu` decode for deterministic payloads, and slightly improved GPU decode. On the tested 4-vCPU Linode box, the default CPU decode worker policy (`available CPUs - 1`) reduced full-song CPU decode from `170.18 s` to `92.52 s`. Forcing `4` workers reached `82.33 s`. Worker-mode CPU decode is deterministic for a fixed worker topology, but it is not hash-identical to the previous threaded single-process CPU decode.
+
+### Deterministic entropy path
 
 ### Bitstream version `acv=4`
 
@@ -58,7 +62,7 @@ Benchmarked on April 3, 2026 on a Linode `g2-gpu-rtx4000a1-s` instance (1x RTX 4
 | Fork `cuda -> cpu` | `12.94 s` | `16.11x` | `167.56 s` | `1.24x` | cross-architecture decode succeeds |
 | Fork `cpu -> cpu` | `35.22 s` | `5.92x` | `160.96 s` | `1.30x` | encode `2.95x` faster than upstream CPU, CPU decode slower |
 
-What this means in practice:
+Summary:
 
 - The biggest RTX win is encode throughput. On this full-length track, the fork cut GPU encode time from `99.07 s` to `13.09 s`.
 - GPU decode is modestly faster than upstream on the same Ada card, but the main portability win is that `cuda -> cpu` decode works at all.
