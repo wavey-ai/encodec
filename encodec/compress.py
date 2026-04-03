@@ -19,6 +19,16 @@ from concurrent.futures.process import BrokenProcessPool
 
 import torch
 
+try:
+    import encodec_native as _encodec_native
+except ImportError:
+    _encodec_native = None
+
+try:
+    from . import torch_ext as _torch_ext_loader
+except Exception:
+    _torch_ext_loader = None
+
 from . import binary
 from .model import EncodecModel, EncodedFrame
 from .quantization.ac import (
@@ -85,8 +95,12 @@ MIN_RANGE            = _env_int("ENCODEC_AC_MIN_RANGE", 2)
 USE_NEAR_UNIFORM     = _env_bool("ENCODEC_USE_NEAR_UNIFORM", False)
 DETERMINISTIC_LM_DTYPE = _env_dtype("ENCODEC_DETERMINISTIC_LM_DTYPE", torch.float64)
 LM_DEVICE_MODE       = _env_choice("ENCODEC_LM_DEVICE", "cpu", {"cpu", "model"})
+DECODE_LM_DEVICE_MODE = _env_choice("ENCODEC_DECODE_LM_DEVICE", "auto", {"auto", "cpu", "model"})
 LM_CHUNKED_DEFAULT   = _env_bool("ENCODEC_LM_CHUNKED", True)
 SEGMENT_WORKERS_DEFAULT = _env_int("ENCODEC_SEGMENT_WORKERS", 1)
+NATIVE_AC_ENABLED    = _env_bool("ENCODEC_NATIVE_AC", True)
+TORCH_EXT_AC_ENABLED = _env_bool("ENCODEC_TORCH_EXT", False)
+ARITHMETIC_TOTAL_RANGE_BITS = 24
 
 _IDX_CACHE: tp.Dict[tp.Tuple[str, int, int], torch.Tensor] = {}
 _UNIFORM_CDF_CACHE: tp.Dict[tp.Tuple[str, int, int, int, int], torch.Tensor] = {}
@@ -94,8 +108,15 @@ _CHUNK_HEADER = struct.Struct('!II')   # chunk_len (uint32 BE), crc32 (uint32 BE
 ProgressCallback = tp.Optional[tp.Callable[[tp.Dict[str, tp.Any]], None]]
 _WORKER_MODEL_CACHE: tp.Dict[tp.Tuple[str, float], EncodecModel] = {}
 _WORKER_LM_CACHE: tp.Dict[tp.Tuple[str, float, str], tp.Any] = {}
+# Preview/audio decode is a hot path in scratch.fm, so keep decoder models and
+# LM instances alive instead of rebuilding them for every payload.
+_DECODE_MODEL_CACHE: tp.Dict[tp.Tuple[str, str], EncodecModel] = {}
+_DECODE_LM_CACHE: tp.Dict[tp.Tuple[str, str, str, float], tp.Any] = {}
+_DECODE_LEGACY_LM_CACHE: tp.Dict[tp.Tuple[str, str, str], tp.Any] = {}
 _PARALLEL_EXECUTOR: tp.Optional[concurrent.futures.ProcessPoolExecutor] = None
 _PARALLEL_EXECUTOR_WORKERS = 0
+_TORCH_AC_MODULE: tp.Optional[tp.Any] = None
+_TORCH_AC_LOAD_FAILED = False
 
 
 # ---------------------------------------------------------------------------
@@ -158,6 +179,92 @@ def _softmax_or_uniform(x: torch.Tensor, dim: int) -> torch.Tensor:
     k = x.size(dim)
     u = torch.full_like(s, 1.0 / k, dtype=torch.float64)
     return torch.where(near, u, s)
+
+
+def _torch_ac_module() -> tp.Optional[tp.Any]:
+    global _TORCH_AC_MODULE, _TORCH_AC_LOAD_FAILED
+    if not TORCH_EXT_AC_ENABLED or _torch_ext_loader is None or _TORCH_AC_LOAD_FAILED:
+        return None
+    if _TORCH_AC_MODULE is not None:
+        return _TORCH_AC_MODULE
+    try:
+        _TORCH_AC_MODULE = _torch_ext_loader.load_extension()
+    except Exception:
+        _TORCH_AC_LOAD_FAILED = True
+        return None
+    return _TORCH_AC_MODULE
+
+
+def _tensor_native_ac_module() -> tp.Optional[tp.Any]:
+    module = _torch_ac_module()
+    if module is not None:
+        return module
+    if NATIVE_AC_ENABLED and _encodec_native is not None:
+        return _encodec_native
+    return None
+
+
+def _native_ac_available() -> bool:
+    return _tensor_native_ac_module() is not None
+
+
+def _can_batch_lm_encode(lm_device: torch.device, coder_device: torch.device) -> bool:
+    # Only batch the deterministic CPU path that we have validated byte-for-byte
+    # against the existing stepwise encoder.
+    return lm_device.type == "cpu" and coder_device.type == "cpu"
+
+
+def _compute_lm_probas_for_frame(
+    frame: torch.Tensor,
+    *,
+    lm: tp.Any,
+    lm_device: torch.device,
+    lm_tau: float,
+) -> torch.Tensor:
+    """Run the LM over a whole frame with teacher forcing.
+
+    The returned probabilities are shaped [1, card, K, T] and match the
+    stepwise encoder's quantized CDFs on the deterministic CPU path.
+    """
+    _B, K, T = frame.shape
+    if T <= 0:
+        raise ValueError("LM frame must contain at least one timestep.")
+
+    prefix = torch.zeros(1, K, 1, dtype=torch.long, device=lm_device)
+    if T == 1:
+        teacher = prefix
+    else:
+        teacher = torch.cat([prefix, 1 + frame[:, :, :-1].detach().to(lm_device)], dim=-1)
+
+    with torch.inference_mode():
+        logits_raw, _, _ = lm.forward_logits(teacher, None, 0)
+        logits_q = _quantize_logits_(logits_raw / lm_tau, LOGIT_QSTEP)
+        return _softmax_or_uniform(logits_q, dim=1)
+
+
+def _flatten_lm_block_for_coder(
+    probas: torch.Tensor,
+    frame: torch.Tensor,
+    *,
+    coder_device: torch.device,
+) -> tp.Tuple[torch.Tensor, torch.Tensor]:
+    """Flatten a full LM block into time-major columns for the entropy coder."""
+    pdf_cols = (
+        probas[0]
+        .permute(0, 2, 1)
+        .contiguous()
+        .reshape(probas.shape[1], -1)
+        .to(coder_device)
+    )
+    symbols = (
+        frame[0]
+        .transpose(0, 1)
+        .contiguous()
+        .reshape(-1)
+        .detach()
+        .to(coder_device)
+    )
+    return pdf_cols, symbols
 
 
 def _deterministic_cdf(pdf: torch.Tensor,
@@ -419,6 +526,78 @@ def _get_parallel_worker_model(
     return model, lm
 
 
+def _device_key(device: tp.Union[str, torch.device]) -> str:
+    return str(torch.device(device))
+
+
+def _get_decode_model(model_name: str, device: tp.Union[str, torch.device]) -> EncodecModel:
+    key = (model_name, _device_key(device))
+    model = _DECODE_MODEL_CACHE.get(key)
+    if model is None:
+        model = MODELS[model_name]().to(device).eval()
+        _DECODE_MODEL_CACHE[key] = model
+    return model
+
+
+def _select_decode_lm_device(
+    *,
+    model_device: tp.Union[str, torch.device],
+    coder_device: tp.Union[str, torch.device],
+    acv: int,
+) -> torch.device:
+    model_device = torch.device(model_device)
+    coder_device = torch.device(coder_device)
+
+    if acv < 3:
+        return coder_device
+    if DECODE_LM_DEVICE_MODE == "cpu":
+        return coder_device
+    if DECODE_LM_DEVICE_MODE == "model":
+        return model_device
+    # Auto: keep legacy / CPU-safe behavior everywhere except CUDA, where the
+    # deterministic float64 LM path is materially faster and parity-clean.
+    if model_device.type == "cuda":
+        return model_device
+    return coder_device
+
+
+def _get_decode_lms(
+    model: EncodecModel,
+    *,
+    model_name: str,
+    coder_device: tp.Union[str, torch.device],
+    lm_device: tp.Union[str, torch.device],
+    use_lm: bool,
+    acv: int,
+    lm_tau: float,
+) -> tp.Tuple[tp.Optional[tp.Any], tp.Optional[tp.Any]]:
+    coder_key = _device_key(coder_device)
+    if not use_lm:
+        return None, None
+
+    if acv >= 3:
+        lm_key = (model_name, _device_key(lm_device), str(DETERMINISTIC_LM_DTYPE), float(lm_tau))
+        lm = _DECODE_LM_CACHE.get(lm_key)
+        if lm is None:
+            lm = model.get_lm_model(
+                device=torch.device(lm_device),
+                dtype=DETERMINISTIC_LM_DTYPE,
+            ).eval()
+            lm.tau = float(lm_tau)
+            _DECODE_LM_CACHE[lm_key] = lm
+        return lm, None
+
+    legacy_key = (model_name, coder_key, str(torch.float32))
+    legacy_lm = _DECODE_LEGACY_LM_CACHE.get(legacy_key)
+    if legacy_lm is None:
+        legacy_lm = model.get_lm_model(
+            device=torch.device(coder_key),
+            dtype=torch.float32,
+        ).eval()
+        _DECODE_LEGACY_LM_CACHE[legacy_key] = legacy_lm
+    return None, legacy_lm
+
+
 def _encode_segment_batch_worker(
     model_name: str,
     bandwidth: float,
@@ -511,7 +690,46 @@ def _write_frame_payload(
     _B, K, T = frame.shape
     if use_lm:
         assert lm is not None
-        coder = ArithmeticCoder(fo)
+        native_coder = None
+        coder = None
+        native_module = _tensor_native_ac_module()
+        if native_module is not None:
+            native_coder = native_module.ArithmeticEncoder(ARITHMETIC_TOTAL_RANGE_BITS)
+        else:
+            coder = ArithmeticCoder(fo, total_range_bits=ARITHMETIC_TOTAL_RANGE_BITS)
+        if _can_batch_lm_encode(lm_device, coder_device):
+            probas = _compute_lm_probas_for_frame(
+                frame,
+                lm=lm,
+                lm_device=lm_device,
+                lm_tau=lm_tau,
+            )
+            pdf_cols, symbol_tensor = _flatten_lm_block_for_coder(
+                probas,
+                frame,
+                coder_device=coder_device,
+            )
+            if native_coder is not None:
+                native_coder.push_pdf_symbols_torch(
+                    pdf_cols.detach().contiguous(),
+                    symbol_tensor.detach().contiguous(),
+                    FP_SCALE,
+                    MIN_RANGE,
+                )
+            else:
+                assert coder is not None
+                cdf_mat = _deterministic_cdf_multi(
+                    pdf_cols, coder.total_range_bits,
+                    fp_scale=FP_SCALE, min_range=MIN_RANGE, check=False)
+                cdf_cols = cdf_mat.t().contiguous()
+                for col, value in enumerate(symbol_tensor.tolist()):
+                    coder.push(value, cdf_cols[col])
+            if native_coder is not None:
+                fo.write(bytes(native_coder.finish()))
+            else:
+                assert coder is not None
+                coder.flush()
+            return
         states = None
         offset = 0
         input_ = torch.zeros(1, K, 1, dtype=torch.long, device=lm_device)
@@ -526,21 +744,34 @@ def _write_frame_payload(
                 probas = _softmax_or_uniform(logits_q, dim=1)
 
             pdf_mat = probas[0, :, :, 0].to(coder_device)
-            cdf_mat = _deterministic_cdf_multi(
-                pdf_mat, coder.total_range_bits,
-                fp_scale=FP_SCALE, min_range=MIN_RANGE, check=False)
-            cdf_cols = cdf_mat.t().contiguous()
-
             frame_slice = frame[:, :, t:t + 1].detach().to(coder_device)
-            for k, value in enumerate(frame_slice[0, :, 0].tolist()):
-                coder.push(value, cdf_cols[k])
+            symbol_tensor = frame_slice[0, :, 0].detach().contiguous()
+            if native_coder is not None:
+                native_coder.push_pdf_symbols_torch(
+                    pdf_mat.detach().contiguous(),
+                    symbol_tensor,
+                    FP_SCALE,
+                    MIN_RANGE,
+                )
+            else:
+                assert coder is not None
+                cdf_mat = _deterministic_cdf_multi(
+                    pdf_mat, coder.total_range_bits,
+                    fp_scale=FP_SCALE, min_range=MIN_RANGE, check=False)
+                cdf_cols = cdf_mat.t().contiguous()
+                for k, value in enumerate(symbol_tensor.tolist()):
+                    coder.push(value, cdf_cols[k])
             input_ = (1 + frame_slice).to(lm_device)
         else:
             for value in frame[0, :, t].detach().cpu().tolist():
                 packer.push(value)
 
     if use_lm:
-        coder.flush()
+        if native_coder is not None:
+            fo.write(bytes(native_coder.finish()))
+        else:
+            assert coder is not None
+            coder.flush()
     else:
         packer.flush()
 
@@ -785,8 +1016,9 @@ def decompress_from_file(fo: tp.IO[bytes],
       * acv=4  — deterministic LM streams (this implementation).
                  Corrupt segments fall back to silence rather than aborting.
 
-    The model (EnCodec encoder/decoder) runs on ``device``; the LM and
-    arithmetic coder always run on CPU.
+    The model (EnCodec encoder/decoder) runs on ``device``. The arithmetic
+    coder always runs on CPU; the deterministic LM path can run on the model
+    device when configured.
     """
     metadata = binary.read_ecdc_header(fo)
     model_name   = metadata['m']
@@ -805,20 +1037,24 @@ def decompress_from_file(fo: tp.IO[bytes],
     if acv > 4:
         raise ValueError(f"Unsupported bitstream version {acv}; re-encode.")
 
-    model = MODELS[model_name]().to(device).eval()
+    model = _get_decode_model(model_name, device)
     model_device = next(model.parameters()).device
     coder_device = torch.device("cpu")
+    lm_device = _select_decode_lm_device(
+        model_device=model_device,
+        coder_device=coder_device,
+        acv=acv,
+    )
 
-    lm = None
-    legacy_lm = None
-    if use_lm and acv >= 3:
-        lm = model.get_lm_model(device=coder_device,
-                                dtype=DETERMINISTIC_LM_DTYPE).eval()
-        lm.tau = lm_tau
-    elif use_lm:
-        # Legacy streams: original Facebook LM path (float32, no quantisation).
-        legacy_lm = model.get_lm_model(device=coder_device,
-                                       dtype=torch.float32).eval()
+    lm, legacy_lm = _get_decode_lms(
+        model,
+        model_name=model_name,
+        coder_device=coder_device,
+        lm_device=lm_device,
+        use_lm=use_lm,
+        acv=acv,
+        lm_tau=lm_tau,
+    )
 
     segment_length = model.segment_length or audio_length
     segment_stride = model.segment_stride or audio_length
@@ -847,67 +1083,90 @@ def decompress_from_file(fo: tp.IO[bytes],
             scale = None
 
         if use_lm:
-            decoder = ArithmeticDecoder(frame_fo)
+            native_decoder = None
+            code_buf = None
+            decoder = None
+            native_module = _tensor_native_ac_module() if acv == 4 else None
+            if native_module is not None:
+                native_decoder = native_module.ArithmeticDecoder(
+                    frame_fo.read(),
+                    ARITHMETIC_TOTAL_RANGE_BITS,
+                )
+                code_buf = torch.empty(num_codebooks, dtype=torch.long, device=coder_device)
+            else:
+                decoder = ArithmeticDecoder(frame_fo, total_range_bits=ARITHMETIC_TOTAL_RANGE_BITS)
             states = None
             offset = 0
             input_ = torch.zeros(1, num_codebooks, 1, dtype=torch.long,
-                                 device=coder_device)
+                                 device=lm_device if acv >= 3 else coder_device)
         else:
             unpacker = binary.BitUnpacker(model.bits_per_codebook, frame_fo)
 
         frame = torch.zeros(1, num_codebooks, frame_length,
                             dtype=torch.long, device=coder_device)
         try:
-            for t in range(frame_length):
-                if use_lm and acv >= 3:
-                    with torch.inference_mode():
+            with torch.inference_mode():
+                for t in range(frame_length):
+                    if use_lm and acv >= 3:
                         logits_raw, states, offset = lm.forward_logits(
                             input_, states, offset)
                         logits_q = _quantize_logits_(logits_raw / lm_tau,
                                                      LOGIT_QSTEP)
                         probas = _softmax_or_uniform(logits_q, dim=1)
+                        pdf_mat = probas[0, :, :, 0].to(coder_device)
+                        if native_decoder is not None:
+                            assert code_buf is not None
+                            native_decoder.pull_symbols_into_torch(
+                                pdf_mat.detach().contiguous(),
+                                code_buf,
+                                fp_scale,
+                                min_range,
+                            )
+                            frame[0, :, t] = code_buf
+                            input_ = 1 + code_buf.view(1, num_codebooks, 1).to(
+                                lm_device,
+                            )
+                        else:
+                            assert decoder is not None
+                            cdf_mat = _deterministic_cdf_multi(
+                                pdf_mat, decoder.total_range_bits,
+                                fp_scale=fp_scale, min_range=min_range, check=False)
+                            cdf_cols = cdf_mat.t().contiguous()
+                            code_list = []
+                            for k in range(num_codebooks):
+                                code = decoder.pull(cdf_cols[k])
+                                if code is None:
+                                    raise EOFError("Stream ended before expected.")
+                                code_list.append(code)
+                            frame[0, :, t] = torch.tensor(code_list, dtype=torch.long,
+                                                          device=coder_device)
+                            input_ = (1 + frame[:, :, t:t + 1]).to(lm_device)
 
-                    pdf_mat = probas[0, :, :, 0].to(coder_device)
-                    cdf_mat = _deterministic_cdf_multi(
-                        pdf_mat, decoder.total_range_bits,
-                        fp_scale=fp_scale, min_range=min_range, check=False)
-                    cdf_cols = cdf_mat.t().contiguous()
-                    code_list: tp.List[int] = []
-                    for k in range(num_codebooks):
-                        code = decoder.pull(cdf_cols[k])
-                        if code is None:
-                            raise EOFError("Stream ended before expected.")
-                        code_list.append(code)
-                    frame[0, :, t] = torch.tensor(code_list, dtype=torch.long,
-                                                  device=coder_device)
-                    input_ = 1 + frame[:, :, t:t + 1]
-
-                elif use_lm:  # legacy path
-                    with torch.inference_mode():
+                    elif use_lm:  # legacy path
                         probas, states, offset = legacy_lm.forward_legacy(
                             input_, states, offset)
-                    code_list = []
-                    for k in range(num_codebooks):
-                        q_cdf = build_stable_quantized_cdf(
-                            probas[0, :, k, 0], decoder.total_range_bits,
-                            check=False)
-                        code = decoder.pull(q_cdf)
-                        if code is None:
-                            raise EOFError("Stream ended before expected.")
-                        code_list.append(code)
-                    frame[0, :, t] = torch.tensor(code_list, dtype=torch.long,
-                                                  device=coder_device)
-                    input_ = 1 + frame[:, :, t:t + 1]
+                        code_list = []
+                        for k in range(num_codebooks):
+                            q_cdf = build_stable_quantized_cdf(
+                                probas[0, :, k, 0], decoder.total_range_bits,
+                                check=False)
+                            code = decoder.pull(q_cdf)
+                            if code is None:
+                                raise EOFError("Stream ended before expected.")
+                            code_list.append(code)
+                        frame[0, :, t] = torch.tensor(code_list, dtype=torch.long,
+                                                      device=coder_device)
+                        input_ = 1 + frame[:, :, t:t + 1]
 
-                else:
-                    code_list = []
-                    for _ in range(num_codebooks):
-                        code = unpacker.pull()
-                        if code is None:
-                            raise EOFError("Stream ended before expected.")
-                        code_list.append(code)
-                    frame[0, :, t] = torch.tensor(code_list, dtype=torch.long,
-                                                  device=coder_device)
+                    else:
+                        code_list = []
+                        for _ in range(num_codebooks):
+                            code = unpacker.pull()
+                            if code is None:
+                                raise EOFError("Stream ended before expected.")
+                            code_list.append(code)
+                        frame[0, :, t] = torch.tensor(code_list, dtype=torch.long,
+                                                      device=coder_device)
 
         except Exception:
             if acv == 4:

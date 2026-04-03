@@ -1,0 +1,12 @@
+[package]
+name = "encodec_native"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "encodec_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.28.3", features = ["extension-module", "abi3-py310"] }
+numpy = "0.28.0"
