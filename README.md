@@ -3,48 +3,16 @@
 ![linter badge](https://github.com/facebookresearch/encodec/workflows/linter/badge.svg)
 ![tests badge](https://github.com/facebookresearch/encodec/workflows/tests/badge.svg)
 
-This is the code for the EnCodec neural codec presented in [High Fidelity Neural Audio Compression](https://arxiv.org/pdf/2210.13438.pdf) [[abs]](https://arxiv.org/abs/2210.13438). We provide two multi-bandwidth models:
+## Index
 
-- A causal model operating at **24 kHz** on monophonic audio trained on a variety of audio data.
-- A non-causal model operating at **48 kHz** on stereophonic audio trained on music-only data.
+- [wavey-ai fork README](#wavey-ai-fork-readme)
+- [Upstream README](#upstream-readme)
+
+## wavey-ai fork README
 
 Bottom line for the `wavey-ai` fork: on an RTX 4000 Ada, the deterministic LM path cut 48 kHz GPU encode from `99s` to `13s` on a full song, made `cuda -> cpu` decode work reliably, and slightly improved GPU decode. The trade-off is that CPU-only decode is slower than upstream.
 
-The 24 kHz model supports 1.5, 3, 6, 12, and 24 kbps. The 48 kHz model supports 3, 6, 12, and 24 kbps. A pre-trained language model is available for each, enabling entropy coding that reduces bitstream size by up to 40% without further quality loss.
-
-<p align="center">
-<img src="./architecture.png" alt="EnCodec architecture: convolutional+LSTM encoder, Residual Vector Quantization, convolutional+LSTM decoder, multiscale complex spectrogram discriminator, small transformer LM." width="800px"></p>
-
-## Samples
-
-Samples including baselines are on [our sample page](https://ai.honu.io/papers/encodec/samples.html). A quick demo of 48 kHz music with entropy coding is available by clicking the thumbnail (original tracks by [Lucille Crew](https://open.spotify.com/artist/5eLv7rNfrf3IjMnK311ByP?si=X_zD9ackRRGjFP5Y6Q7Zng) and [Voyageur I](https://open.spotify.com/artist/21HymveeIhDcM4KDKeNLz0?si=4zXF8VpeQpeKR9QUIuck9Q)).
-
-<p align="center">
-<a href="https://ai.honu.io/papers/encodec/final.mp4">
-<img src="./thumbnail.png" alt="Thumbnail for the sample video."></a></p>
-
-## 🤗 Transformers
-
-EnCodec is available in Transformers. See the [Transformers EnCodec docs](https://huggingface.co/docs/transformers/main/en/model_doc/encodec), and the [24 kHz](https://huggingface.co/facebook/encodec_24khz) and [48 kHz](https://huggingface.co/facebook/encodec_48khz) checkpoints on the Hub.
-
-```python
-from datasets import load_dataset, Audio
-from transformers import EncodecModel, AutoProcessor
-
-librispeech_dummy = load_dataset("hf-internal-testing/librispeech_asr_dummy", "clean", split="validation")
-model = EncodecModel.from_pretrained("facebook/encodec_24khz")
-processor = AutoProcessor.from_pretrained("facebook/encodec_24khz")
-librispeech_dummy = librispeech_dummy.cast_column("audio", Audio(sampling_rate=processor.sampling_rate))
-audio_sample = librispeech_dummy[0]["audio"]["array"]
-inputs = processor(raw_audio=audio_sample, sampling_rate=processor.sampling_rate, return_tensors="pt")
-encoder_outputs = model.encode(inputs["input_values"], inputs["padding_mask"])
-audio_values = model.decode(encoder_outputs.audio_codes, encoder_outputs.audio_scales, inputs["padding_mask"])[0]
-audio_codes = model(inputs["input_values"], inputs["padding_mask"]).audio_codes
-```
-
----
-
-## Precision and Robustness Improvements (wavey-ai fork)
+### Precision and Robustness Improvements
 
 This fork extends the original EnCodec with a fully deterministic, cross-platform entropy coding path plus optional native entropy-coder acceleration. The neural network weights remain unchanged.
 
@@ -151,6 +119,49 @@ Benchmarked on 7 stereo 48 kHz music tracks (10 s clips), `encodec_48khz`:
 
 RTF < 1.0 means faster than real time. On Apple Silicon the LM still runs on CPU by default, so MPS primarily accelerates model encode/decode. On CUDA decode, `ENCODEC_DECODE_LM_DEVICE=auto` can move deterministic LM decode to the GPU, which is what the Ada benchmark above measures.
 
+### Backward compatibility and native fast path
+
+The repo remains backward-compatible by default:
+
+- If the Rust module is not installed, the codec falls back to the Python entropy path.
+- If the Torch C++ extension is not available, nothing breaks; it is off by default.
+- Legacy payloads (`acv < 3`) still decode through the legacy path.
+- Deterministic chunked payloads (`acv=4`) keep cross-device decode compatibility.
+
+Local fallback setup, no extra toolchain required:
+
+```bash
+pip install -e .
+```
+
+That is enough to run the codec locally in pure Python.
+
+Rust fast path, recommended:
+
+```bash
+pip install -e .
+pip install maturin
+cd native/encodec_ac
+maturin develop --release
+```
+
+This installs the `encodec_native` module into the active virtualenv. The runtime will pick it up automatically when available.
+
+Optional Torch C++ extension:
+
+- This remains opt-in and is off by default.
+- It requires a working C++ toolchain compatible with your local PyTorch install.
+- Enable it with `ENCODEC_TORCH_EXT=1`; the extension is JIT-built on first use.
+- In our testing, the Rust path is the main win. The Torch extension is optional, not required for the accelerated path.
+
+Useful runtime knobs:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `ENCODEC_NATIVE_AC` | `1` | Use the Rust arithmetic/CDF path when `encodec_native` is installed. |
+| `ENCODEC_TORCH_EXT` | `0` | Enable the optional Torch C++ extension. |
+| `ENCODEC_DECODE_LM_DEVICE` | `auto` | On CUDA decode, prefer GPU LM decode while preserving payload compatibility. |
+
 ### Chunk size tradeoffs
 
 Per-segment chunk overhead is dominated by LM segmentation granularity, not the 8-byte header:
@@ -164,6 +175,45 @@ Per-segment chunk overhead is dominated by LM segmentation granularity, not the 
 The default 1.0 s (matching the 48 kHz model segment) gives the best bitrate/isolation tradeoff.
 
 ---
+
+## Upstream README
+
+This is the code for the EnCodec neural codec presented in [High Fidelity Neural Audio Compression](https://arxiv.org/pdf/2210.13438.pdf) [[abs]](https://arxiv.org/abs/2210.13438). We provide two multi-bandwidth models:
+
+- A causal model operating at **24 kHz** on monophonic audio trained on a variety of audio data.
+- A non-causal model operating at **48 kHz** on stereophonic audio trained on music-only data.
+
+The 24 kHz model supports 1.5, 3, 6, 12, and 24 kbps. The 48 kHz model supports 3, 6, 12, and 24 kbps. A pre-trained language model is available for each, enabling entropy coding that reduces bitstream size by up to 40% without further quality loss.
+
+<p align="center">
+<img src="./architecture.png" alt="EnCodec architecture: convolutional+LSTM encoder, Residual Vector Quantization, convolutional+LSTM decoder, multiscale complex spectrogram discriminator, small transformer LM." width="800px"></p>
+
+## Samples
+
+Samples including baselines are on [our sample page](https://ai.honu.io/papers/encodec/samples.html). A quick demo of 48 kHz music with entropy coding is available by clicking the thumbnail (original tracks by [Lucille Crew](https://open.spotify.com/artist/5eLv7rNfrf3IjMnK311ByP?si=X_zD9ackRRGjFP5Y6Q7Zng) and [Voyageur I](https://open.spotify.com/artist/21HymveeIhDcM4KDKeNLz0?si=4zXF8VpeQpeKR9QUIuck9Q)).
+
+<p align="center">
+<a href="https://ai.honu.io/papers/encodec/final.mp4">
+<img src="./thumbnail.png" alt="Thumbnail for the sample video."></a></p>
+
+## 🤗 Transformers
+
+EnCodec is available in Transformers. See the [Transformers EnCodec docs](https://huggingface.co/docs/transformers/main/en/model_doc/encodec), and the [24 kHz](https://huggingface.co/facebook/encodec_24khz) and [48 kHz](https://huggingface.co/facebook/encodec_48khz) checkpoints on the Hub.
+
+```python
+from datasets import load_dataset, Audio
+from transformers import EncodecModel, AutoProcessor
+
+librispeech_dummy = load_dataset("hf-internal-testing/librispeech_asr_dummy", "clean", split="validation")
+model = EncodecModel.from_pretrained("facebook/encodec_24khz")
+processor = AutoProcessor.from_pretrained("facebook/encodec_24khz")
+librispeech_dummy = librispeech_dummy.cast_column("audio", Audio(sampling_rate=processor.sampling_rate))
+audio_sample = librispeech_dummy[0]["audio"]["array"]
+inputs = processor(raw_audio=audio_sample, sampling_rate=processor.sampling_rate, return_tensors="pt")
+encoder_outputs = model.encode(inputs["input_values"], inputs["padding_mask"])
+audio_values = model.decode(encoder_outputs.audio_codes, encoder_outputs.audio_scales, inputs["padding_mask"])[0]
+audio_codes = model(inputs["input_values"], inputs["padding_mask"]).audio_codes
+```
 
 ## Installation
 
