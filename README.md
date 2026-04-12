@@ -15,8 +15,38 @@ This fork keeps the upstream model weights and changes the codec/runtime behavio
 - a deterministic `acv=4` entropy path for cross-device payload compatibility
 - optional native entropy-coder acceleration
 - chunked CPU decode parallelism for `acv=4` payloads
+- a frame-level ONNX export boundary for the neural encoder/decoder
 
 On the RTX 4000 Ada benchmark in this README, the fork improved 48 kHz GPU encode from `99.07 s` to `13.09 s`, preserved `cuda -> cpu` decode for deterministic payloads, and slightly improved GPU decode. On the tested 4-vCPU Linode box, the default CPU decode worker policy (`available CPUs - 1`) reduced full-song CPU decode from `170.18 s` to `92.52 s`. Forcing `4` workers reached `82.33 s`. Worker-mode CPU decode is deterministic for a fixed worker topology, but it is not hash-identical to the previous threaded single-process CPU decode.
+
+### Composable split
+
+The intended split in this fork is now:
+
+- neural frame codec: `_encode_frame(...)` / `_decode_frame(...)`
+- runtime / bitstream: segmentation, overlap-add, `.ecdc` framing, arithmetic coding, LM entropy path
+
+The ONNX export path only targets the neural frame codec boundary. It does not export the full `compress()` / `decompress()` pipeline.
+
+### Frame ONNX export
+
+Export example:
+
+```bash
+python scripts/export_frame_onnx.py \
+  --model encodec_48khz \
+  --bandwidth 12 \
+  --device cuda \
+  --output-dir out/encodec_48khz_12kbps_onnx
+```
+
+The exporter writes:
+
+- `encode_frame.onnx`
+- `decode_frame.onnx`
+- `bundle.json`
+
+The checked-in `bundle.json` contract is designed for Rust runtimes such as `encodec-rs` to load and run the neural frame path directly through ONNX Runtime.
 
 ### Deterministic entropy path
 
