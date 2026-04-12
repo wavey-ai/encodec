@@ -116,6 +116,11 @@ def export_frame_onnx_bundle(
         output_names=["codes", "scale"],
         opset_version=opset_version,
         dynamo=False,
+        dynamic_axes={
+            "audio": {0: "batch"},
+            "codes": {0: "batch"},
+            "scale": {0: "batch"},
+        },
     )
     torch.onnx.export(
         decoder,
@@ -125,6 +130,11 @@ def export_frame_onnx_bundle(
         output_names=["audio"],
         opset_version=opset_version,
         dynamo=False,
+        dynamic_axes={
+            "codes": {0: "batch"},
+            "scale": {0: "batch"},
+            "audio": {0: "batch"},
+        },
     )
 
     onnx.checker.check_model(str(encode_path))
