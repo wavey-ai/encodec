@@ -6,6 +6,7 @@
 
 """A streamable transformer."""
 
+import math
 import typing as tp
 
 import torch
@@ -53,10 +54,44 @@ class StreamingTransformerEncoderLayer(nn.TransformerEncoderLayer):
         keys_pos = torch.arange(T + H, device=x.device).view(1, -1)
         delta = queries_pos - keys_pos
         valid_access = (delta >= 0) & (delta <= past_context)
+        if torch.onnx.is_in_onnx_export():
+            return self._sa_block_exportable(queries, keys, values, valid_access)
         x = self.self_attn(queries, keys, values,
                            attn_mask=~valid_access,
                            need_weights=False)[0]
         return self.dropout1(x)
+
+    def _sa_block_exportable(
+        self,
+        queries: torch.Tensor,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        valid_access: torch.Tensor,
+    ) -> torch.Tensor:
+        bsz, query_len, embed_dim = queries.shape
+        key_len = keys.shape[1]
+        num_heads = self.self_attn.num_heads
+        head_dim = embed_dim // num_heads
+        scale = 1.0 / math.sqrt(head_dim)
+
+        q_weight, k_weight, v_weight = self.self_attn.in_proj_weight.chunk(3, dim=0)
+        q_bias, k_bias, v_bias = self.self_attn.in_proj_bias.chunk(3, dim=0)
+        q = F.linear(queries, q_weight, q_bias)
+        k = F.linear(keys, k_weight, k_bias)
+        v = F.linear(values, v_weight, v_bias)
+
+        q = q.view(bsz, query_len, num_heads, head_dim).transpose(1, 2)
+        k = k.view(bsz, key_len, num_heads, head_dim).transpose(1, 2)
+        v = v.view(bsz, key_len, num_heads, head_dim).transpose(1, 2)
+
+        scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+        mask = (~valid_access).to(dtype=scores.dtype).view(1, 1, query_len, key_len)
+        scores = scores - mask * 1e9
+        attn = torch.softmax(scores, dim=-1)
+        mixed = torch.matmul(attn, v)
+        mixed = mixed.transpose(1, 2).contiguous().view(bsz, query_len, embed_dim)
+        out = F.linear(mixed, self.self_attn.out_proj.weight, self.self_attn.out_proj.bias)
+        return self.dropout1(out)
 
 
 class StreamingTransformerEncoder(nn.Module):

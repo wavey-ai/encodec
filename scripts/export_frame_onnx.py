@@ -45,6 +45,11 @@ def parse_args() -> argparse.Namespace:
         default=18,
         help="ONNX opset version to export.",
     )
+    parser.add_argument(
+        "--export-lm",
+        action="store_true",
+        help="Also export the streaming LM logits model and include it in bundle metadata.",
+    )
     return parser.parse_args()
 
 
@@ -57,6 +62,7 @@ def main() -> None:
         device=args.device,
         repository=args.repository,
         opset_version=args.opset_version,
+        export_lm=args.export_lm,
     )
     print(metadata_to_json(metadata))
 

@@ -30,9 +30,18 @@ class OnnxFrameBundleMetadata:
     normalize: bool
     num_codebooks: int
     frame_length: int
+    bits_per_codebook: int
+    codebook_cardinality: int
     encode_model: str
     decode_model: str
     opset_version: int
+    lm_model: str | None = None
+    lm_dim: int | None = None
+    lm_num_layers: int | None = None
+    lm_past_context: int | None = None
+    lm_logit_step: float | None = None
+    lm_cardinality: int | None = None
+    lm_dtype: str | None = None
 
 
 class EncodeFrameWrapper(nn.Module):
@@ -58,6 +67,26 @@ class DecodeFrameWrapper(nn.Module):
         return self.model._decode_frame((codes, None))
 
 
+class LmLogitsWrapper(nn.Module):
+    def __init__(self, lm_model: nn.Module):
+        super().__init__()
+        self.lm_model = lm_model
+        self.num_state_tensors = len(self.lm_model.transformer.layers)
+
+    def forward(
+        self,
+        indices: torch.Tensor,
+        offset: torch.Tensor,
+        *states: torch.Tensor,
+    ) -> tp.Any:
+        logits, new_states, next_offset = self.lm_model.forward_logits(
+            indices,
+            list(states),
+            offset,
+        )
+        return logits, next_offset, *new_states
+
+
 def build_model(
     model_name: str,
     bandwidth_kbps: float,
@@ -80,6 +109,7 @@ def export_frame_onnx_bundle(
     device: str = "cpu",
     repository: str | Path | None = None,
     opset_version: int = 18,
+    export_lm: bool = False,
 ) -> OnnxFrameBundleMetadata:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -107,6 +137,7 @@ def export_frame_onnx_bundle(
 
     encode_path = output_dir / "encode_frame.onnx"
     decode_path = output_dir / "decode_frame.onnx"
+    lm_path = output_dir / "lm_logits.onnx"
 
     torch.onnx.export(
         encoder,
@@ -137,6 +168,61 @@ def export_frame_onnx_bundle(
         },
     )
 
+    lm_model_name = None
+    lm_dim = None
+    lm_num_layers = None
+    lm_past_context = None
+    lm_logit_step = None
+    lm_cardinality = None
+    lm_dtype = None
+    if export_lm:
+        lm = model.get_lm_model(device=torch.device(device), dtype=torch.float32).eval()
+        lm_wrapper = LmLogitsWrapper(lm).eval()
+        lm_num_layers = len(lm.transformer.layers)
+        lm_dim = int(lm.dim)
+        lm_past_context = int(lm.transformer.past_context)
+        lm_logit_step = float(lm.logit_step)
+        lm_cardinality = int(lm.card)
+        lm_dtype = "float32"
+        active_codebooks = int(codes.shape[1])
+        dummy_indices = torch.zeros(
+            1,
+            active_codebooks,
+            1,
+            dtype=torch.long,
+            device=device,
+        )
+        dummy_offset = torch.zeros((), dtype=torch.long, device=device)
+        dummy_states = tuple(
+            torch.zeros(
+                (1, lm.transformer.past_context, lm.dim),
+                dtype=lm.dtype,
+                device=device,
+            )
+            for _ in range(lm_num_layers)
+        )
+        input_names = ["indices", "offset", *[f"state_{index}" for index in range(lm_num_layers)]]
+        output_names = ["logits", "offset_out", *[f"next_state_{index}" for index in range(lm_num_layers)]]
+        dynamic_axes: dict[str, dict[int, str]] = {
+            "indices": {0: "batch", 2: "steps"},
+            "logits": {0: "batch", 3: "steps"},
+        }
+        for index in range(lm_num_layers):
+            dynamic_axes[f"state_{index}"] = {0: "batch", 1: "context"}
+            dynamic_axes[f"next_state_{index}"] = {0: "batch", 1: "context"}
+        torch.onnx.export(
+            lm_wrapper,
+            (dummy_indices, dummy_offset, *dummy_states),
+            lm_path,
+            input_names=input_names,
+            output_names=output_names,
+            opset_version=opset_version,
+            dynamo=False,
+            dynamic_axes=dynamic_axes,
+        )
+        onnx.checker.check_model(str(lm_path))
+        lm_model_name = lm_path.name
+
     onnx.checker.check_model(str(encode_path))
     onnx.checker.check_model(str(decode_path))
 
@@ -151,8 +237,17 @@ def export_frame_onnx_bundle(
         normalize=bool(model.normalize),
         num_codebooks=int(codes.shape[1]),
         frame_length=int(codes.shape[2]),
+        bits_per_codebook=int(model.bits_per_codebook),
+        codebook_cardinality=int(model.quantizer.bins),
         encode_model=encode_path.name,
         decode_model=decode_path.name,
+        lm_model=lm_model_name,
+        lm_dim=lm_dim,
+        lm_num_layers=lm_num_layers,
+        lm_past_context=lm_past_context,
+        lm_logit_step=lm_logit_step,
+        lm_cardinality=lm_cardinality,
+        lm_dtype=lm_dtype,
         opset_version=int(opset_version),
     )
     (output_dir / "bundle.json").write_text(json.dumps(asdict(metadata), indent=2) + "\n")
